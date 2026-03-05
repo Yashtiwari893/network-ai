@@ -889,6 +889,53 @@ exports.getRecommendations = async (req, res) => {
 // =============================================================================
 
 /**
+ * Helper: 11za API se WhatsApp template send karo
+ *
+ * @param {Object} opts
+ * @param {string} opts.sendto          - Receiver ka phone (e.g. "919876543210")
+ * @param {string} opts.name            - Receiver ka naam (11za logs ke liye)
+ * @param {string} opts.templateName    - 11za mein registered template name
+ * @param {string[]} opts.data          - Body variables array ["{{1}}", "{{2}}"...]
+ * @param {string|string[]} [opts.buttonValue] - URL button suffix ya quick reply payload
+ * @param {string} [opts.headerdata]    - Header variable (optional)
+ * @param {string} [opts.language]      - Language code, default "en"
+ * @param {string} [opts.tags]          - Comma-separated tags (optional)
+ */
+async function send11zaTemplate({ sendto, name, templateName, data, buttonValue, headerdata, language = "en", tags }) {
+  const payload = {
+    authToken:     process.env.IVY_11ZA_AUTH_TOKEN,
+    name:          name || "",
+    sendto:        sendto,
+    originWebsite: process.env.IVY_11ZA_ORIGIN || "www.11za.com",
+    templateName:  templateName,
+    language:      language,
+    data:          data || []
+  };
+
+  // Optional fields — sirf tab include karo jab provided ho
+  if (buttonValue !== undefined && buttonValue !== null && buttonValue !== "") {
+    payload.buttonValue = buttonValue;
+  }
+  if (headerdata !== undefined && headerdata !== null && headerdata !== "") {
+    payload.headerdata = headerdata;
+  }
+  if (tags) {
+    payload.tags = tags;
+  }
+
+  console.log(`[11za] Sending template "${templateName}" to ${sendto}`);
+
+  const response = await axios.post(
+    "https://api.11za.in/apis/template/sendTemplate",
+    payload,
+    { headers: { "Content-Type": "application/json" } }
+  );
+
+  console.log(`[11za] Template sent to ${sendto}:`, response.data);
+  return response.data;
+}
+
+/**
  * POST /sendConnectionRequest
  * Body: { senderPhone, receiverPhone }
  *
@@ -958,6 +1005,23 @@ exports.sendConnectionRequest = async (req, res) => {
     });
 
     console.log("Connection request created:", newRequest._id);
+
+    // ✅ 11za API se ivy_connection_request template User B (receiver) ko bhejo
+    // Quick Reply button payload = "ACCEPT_<requestId>" — User B tap karega toh
+    // 11za yeh payload capture karega aur acceptConnectionRequest call karega
+    try {
+      await send11zaTemplate({
+        sendto:       newRequest.receiverPhone,
+        name:         receiverUser.name || "",
+        templateName: "ivy_connection_request",
+        data:         [senderUser.name || ""],   // {{1}} = senderName
+        buttonValue:  `ACCEPT_${newRequest._id}` // Quick Reply payload
+      });
+    } catch (templateErr) {
+      // Template fail hona request creation ko fail nahi karega
+      // DB record safe hai — sirf log karo
+      console.error("[11za] ivy_connection_request template send failed:", templateErr?.response?.data || templateErr.message);
+    }
 
     return responseManager.onSuccess("Connection request sent", {
       requestId:     newRequest._id,
@@ -1051,21 +1115,59 @@ exports.acceptConnectionRequest = async (req, res) => {
 
     console.log("Connection request accepted:", requestId);
 
-    // Response contains everything 11za needs to send ivy_match_confirmed
-    // to BOTH users — userA_phone for User A's message, userB_phone for User B
+    // ✅ 11za API se ivy_match_confirmed template DONO users ko bhejo
+    //
+    // User A ko: Chat Now → wa.me/userB_phone  ({{1}}=userB_name, buttonValue=userB_phone)
+    // User B ko: Chat Now → wa.me/userA_phone  ({{1}}=userA_name, buttonValue=userA_phone)
+    //
+    // Note: ivy_match_confirmed template mein URL button ka base: https://wa.me/
+    //       buttonValue = phone number suffix (no + sign)
+    const userAPhone = userA?.phone || request.senderPhone;
+    const userBPhone = userB?.phone || request.receiverPhone;
+    const userAName  = userA?.name  || "";
+    const userBName  = userB?.name  || "";
+
+    // Both template sends parallel mein — faster response
+    const templateResults = await Promise.allSettled([
+      // → User A ko bhejo (Chat Now → User B se baat karo)
+      send11zaTemplate({
+        sendto:       userAPhone,
+        name:         userAName,
+        templateName: "ivy_match_confirmed",
+        data:         [userBName],   // {{1}} = User B ka naam
+        buttonValue:  userBPhone     // URL suffix: wa.me/userBPhone
+      }),
+      // → User B ko bhejo (Chat Now → User A se baat karo)
+      send11zaTemplate({
+        sendto:       userBPhone,
+        name:         userBName,
+        templateName: "ivy_match_confirmed",
+        data:         [userAName],   // {{1}} = User A ka naam
+        buttonValue:  userAPhone     // URL suffix: wa.me/userAPhone
+      })
+    ]);
+
+    // Log any template failures (non-blocking)
+    templateResults.forEach((result, idx) => {
+      if (result.status === "rejected") {
+        const recipient = idx === 0 ? userAPhone : userBPhone;
+        console.error(`[11za] ivy_match_confirmed failed for ${recipient}:`, result.reason?.response?.data || result.reason?.message);
+      }
+    });
+
     return responseManager.onSuccess("Connection request accepted", {
       requestId:    updatedRequest._id,
       status:       updatedRequest.status,
       userA: {
-        phone:        userA?.phone || request.senderPhone,
-        name:         userA?.name  || "",
+        phone:        userAPhone,
+        name:         userAName,
         company_name: userA?.company_name || "",
         link1:        userA?.link1 || "",
         link2:        userA?.link2 || ""
       },
       userB: {
-        phone:        userB?.phone || request.receiverPhone,
-        name:         userB?.name  || "",
+        phone:        userBPhone,
+        name:         userBName,
         company_name: userB?.company_name || "",
         link1:        userB?.link1 || "",
         link2:        userB?.link2 || ""
