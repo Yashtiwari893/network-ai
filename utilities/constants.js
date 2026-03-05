@@ -3,7 +3,8 @@ const constants = {
     VECTOR_INDEX: "vector_index", // name of the Atlas vector index
     MODELS: {
         user: "user",
-        category: "category"
+        category: "category",
+        connectionRequest: "connectionrequest"  // maps to connection_requests via Mongoose pluralisation
     }
 }
 

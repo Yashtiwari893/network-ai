@@ -12,4 +12,9 @@ router.post("/getCategoryByUser", flowController.getCategoryByUser);
 router.post("/getRecommendations", flowController.getRecommendations)
 router.post("/chatbotSearch", flowController.chatbotSearch)
 
+// Connection Request Flow
+router.post("/sendConnectionRequest",  flowController.sendConnectionRequest)
+router.post("/acceptConnectionRequest", flowController.acceptConnectionRequest)
+router.post("/getConnectionStatus",    flowController.getConnectionStatus)
+
 module.exports = router

@@ -2,6 +2,7 @@ const mongoConnection = require("../utilities/connetion");
 const responseManager = require("../utilities/responseManager");
 const flowModel = require("../models/flow.model");
 const userModel = require("../models/user.model");
+const connectionRequestModel = require("../models/connectionRequest.model");
 const constants = require("../utilities/constants");
 const categoryModel = require("../models/category.model");
 const axios = require("axios");
@@ -639,7 +640,7 @@ exports.getCategoryByUser = async (req, res) => {
 // -----------------------------------------------------------------------------
 exports.chatbotSearch = async (req, res) => {
   try {
-    const { query, phone } = req.body;
+    const { query, phone, excludeIds } = req.body;
 
     // input validation
     if (!query || typeof query !== 'string' || !query.trim()) {
@@ -656,6 +657,20 @@ exports.chatbotSearch = async (req, res) => {
       return responseManager.internalServer(new Error('Embedding generation failed'), res);
     }
 
+    // Build excludeIds filter — convert valid strings to ObjectId, skip invalid ones
+    const excludeObjectIds = Array.isArray(excludeIds)
+      ? excludeIds
+          .filter(id => mongoose.Types.ObjectId.isValid(id))
+          .map(id => new mongoose.Types.ObjectId(id))
+      : [];
+
+    // Build $match stage to exclude self (by phone) and excludeIds
+    const matchConditions = {};
+    if (phone) matchConditions.phone = { $ne: phone };
+    if (excludeObjectIds.length > 0) {
+      matchConditions._id = { $nin: excludeObjectIds };
+    }
+
     // build aggregation pipeline for vector search
     const pipeline = [
       {
@@ -664,11 +679,12 @@ exports.chatbotSearch = async (req, res) => {
           path: 'bio_vector',
           queryVector: queryVec,
           numCandidates: 50,
-          limit: 5
+          limit: 10  // fetch more so post-filter still gives enough results
         }
       },
       { $addFields: { score: { $meta: 'vectorSearchScore' } } },
-      ...(phone ? [{ $match: { phone: { $ne: phone } } }] : []),
+      ...(Object.keys(matchConditions).length > 0 ? [{ $match: matchConditions }] : []),
+      { $limit: 5 },
       { $project: { name: 1, company_name: 1, phone: 1, category: 1, bio: 1, link1: 1, score: 1 } }
     ];
 
@@ -695,7 +711,7 @@ exports.chatbotSearch = async (req, res) => {
 // existing recommendation handler follows
 // -----------------------------------------------------------------------------
 exports.getRecommendations = async (req, res) => {
-  const { userId } = req.body;
+  const { userId, excludeIds } = req.body;
   const primary = mongoConnection.useDb(constants.DEFAULT_DB);
   const User = primary.model(constants.MODELS.user, userModel);
   // Constants
@@ -724,6 +740,20 @@ exports.getRecommendations = async (req, res) => {
       try { return mongoose.Types.ObjectId(id); } catch (e) { return id; }
     });
 
+    // Merge DB-tracked shownIds with frontend-provided excludeIds (dedup by string)
+    const extraExcludeIds = Array.isArray(excludeIds)
+      ? excludeIds
+          .filter(id => mongoose.Types.ObjectId.isValid(id))
+          .map(id => new mongoose.Types.ObjectId(id))
+      : [];
+
+    const allExcludedIds = [
+      ...shownIds,
+      ...extraExcludeIds.filter(
+        exId => !shownIds.some(s => s.toString() === exId.toString())
+      )
+    ];
+
     const userObjectId = new mongoose.Types.ObjectId(userId);
 
     // Vector search pipeline
@@ -745,7 +775,7 @@ exports.getRecommendations = async (req, res) => {
         $match: {
           $and: [
             { _id: { $ne: userObjectId } },
-            { _id: { $nin: shownIds } }
+            { _id: { $nin: allExcludedIds } }  // excludes both DB-tracked + frontend-provided IDs
           ]
         }
       },
@@ -850,5 +880,242 @@ exports.getRecommendations = async (req, res) => {
   } catch (error) {
     console.error("Error getting recommendations:", error);
     return res.status(500).json({ message: "Server error", error: error.message });
+  }
+};
+
+
+// =============================================================================
+// CONNECTION REQUEST FLOW
+// =============================================================================
+
+/**
+ * POST /sendConnectionRequest
+ * Body: { senderPhone, receiverPhone }
+ *
+ * Step 1-2 of the 7-step flow:
+ *  - User A taps "Send Request" in the 11za flow
+ *  - Creates a connection_request doc with status "pending"
+ *  - Returns requestId + receiverPhone so 11za can send ivy_connection_request
+ *    template to User B
+ */
+exports.sendConnectionRequest = async (req, res) => {
+  try {
+    const { senderPhone, receiverPhone } = req.body;
+
+    if (!senderPhone || !receiverPhone) {
+      return responseManager.onBadRequest(
+        "senderPhone and receiverPhone are required",
+        res
+      );
+    }
+
+    if (senderPhone.trim() === receiverPhone.trim()) {
+      return responseManager.onBadRequest(
+        "Sender and receiver cannot be the same user",
+        res
+      );
+    }
+
+    const primary = mongoConnection.useDb(constants.DEFAULT_DB);
+    const ConnectionRequest = primary.model(
+      constants.MODELS.connectionRequest,
+      connectionRequestModel
+    );
+    const User = primary.model(constants.MODELS.user, userModel);
+
+    // Verify both users exist
+    const [senderUser, receiverUser] = await Promise.all([
+      User.findOne({ phone: senderPhone.trim() }).select("name phone").lean(),
+      User.findOne({ phone: receiverPhone.trim() }).select("name phone").lean()
+    ]);
+
+    if (!senderUser) {
+      return responseManager.notFoundRequest("Sender user not found", res);
+    }
+    if (!receiverUser) {
+      return responseManager.notFoundRequest("Receiver user not found", res);
+    }
+
+    // Check for existing pending request between these two users
+    const existingRequest = await ConnectionRequest.findOne({
+      senderPhone:   senderPhone.trim(),
+      receiverPhone: receiverPhone.trim(),
+      status:        "pending"
+    }).lean();
+
+    if (existingRequest) {
+      return responseManager.onBadRequest(
+        "A pending connection request already exists between these users",
+        res
+      );
+    }
+
+    // Create the connection request
+    const newRequest = await ConnectionRequest.create({
+      senderPhone:   senderPhone.trim(),
+      receiverPhone: receiverPhone.trim(),
+      status:        "pending"
+    });
+
+    console.log("Connection request created:", newRequest._id);
+
+    return responseManager.onSuccess("Connection request sent", {
+      requestId:     newRequest._id,
+      senderPhone:   newRequest.senderPhone,
+      receiverPhone: newRequest.receiverPhone,
+      senderName:    senderUser.name || "",
+      receiverName:  receiverUser.name || "",
+      status:        newRequest.status,
+      createdAt:     newRequest.createdAt
+    }, res);
+
+  } catch (error) {
+    console.error("sendConnectionRequest error:", error);
+    return responseManager.internalServer(error, res);
+  }
+};
+
+
+/**
+ * POST /acceptConnectionRequest
+ * Body: { requestId, receiverPhone }
+ *
+ * Step 4-5 of the 7-step flow:
+ *  - User B taps "Accept Request" Quick Reply button in WhatsApp
+ *  - Validates that the receiver matches the request
+ *  - Updates status to "accepted"
+ *  - Returns both users' data so 11za can send ivy_match_confirmed
+ *    template to BOTH User A and User B
+ */
+exports.acceptConnectionRequest = async (req, res) => {
+  try {
+    const { requestId, receiverPhone } = req.body;
+
+    if (!requestId || !receiverPhone) {
+      return responseManager.onBadRequest(
+        "requestId and receiverPhone are required",
+        res
+      );
+    }
+
+    if (!mongoose.Types.ObjectId.isValid(requestId)) {
+      return responseManager.onBadRequest("Invalid requestId format", res);
+    }
+
+    const primary = mongoConnection.useDb(constants.DEFAULT_DB);
+    const ConnectionRequest = primary.model(
+      constants.MODELS.connectionRequest,
+      connectionRequestModel
+    );
+    const User = primary.model(constants.MODELS.user, userModel);
+
+    // Fetch the request
+    const request = await ConnectionRequest.findById(requestId).lean();
+
+    if (!request) {
+      return responseManager.notFoundRequest("Connection request not found", res);
+    }
+
+    // Security: only the intended receiver can accept
+    if (request.receiverPhone !== receiverPhone.trim()) {
+      return responseManager.onBadRequest(
+        "You are not the intended receiver of this request",
+        res
+      );
+    }
+
+    if (request.status === "accepted") {
+      return responseManager.onBadRequest("Request already accepted", res);
+    }
+
+    if (request.status === "rejected") {
+      return responseManager.onBadRequest("Request has been rejected", res);
+    }
+
+    // Update status to accepted
+    const updatedRequest = await ConnectionRequest.findByIdAndUpdate(
+      requestId,
+      { $set: { status: "accepted" } },
+      { new: true }
+    );
+
+    // Fetch both users' data for the match confirmed template
+    const [userA, userB] = await Promise.all([
+      User.findOne({ phone: request.senderPhone })
+          .select("name phone company_name bio link1 link2 category")
+          .lean(),
+      User.findOne({ phone: request.receiverPhone })
+          .select("name phone company_name bio link1 link2 category")
+          .lean()
+    ]);
+
+    console.log("Connection request accepted:", requestId);
+
+    // Response contains everything 11za needs to send ivy_match_confirmed
+    // to BOTH users — userA_phone for User A's message, userB_phone for User B
+    return responseManager.onSuccess("Connection request accepted", {
+      requestId:    updatedRequest._id,
+      status:       updatedRequest.status,
+      userA: {
+        phone:        userA?.phone || request.senderPhone,
+        name:         userA?.name  || "",
+        company_name: userA?.company_name || "",
+        link1:        userA?.link1 || "",
+        link2:        userA?.link2 || ""
+      },
+      userB: {
+        phone:        userB?.phone || request.receiverPhone,
+        name:         userB?.name  || "",
+        company_name: userB?.company_name || "",
+        link1:        userB?.link1 || "",
+        link2:        userB?.link2 || ""
+      }
+    }, res);
+
+  } catch (error) {
+    console.error("acceptConnectionRequest error:", error);
+    return responseManager.internalServer(error, res);
+  }
+};
+
+
+/**
+ * POST /getConnectionStatus
+ * Body: { requestId }
+ *
+ * Utility endpoint — 11za ya frontend check kar sake ki request
+ * abhi bhi pending hai ya accept/reject ho gayi.
+ */
+exports.getConnectionStatus = async (req, res) => {
+  try {
+    const { requestId } = req.body;
+
+    if (!requestId) {
+      return responseManager.onBadRequest("requestId is required", res);
+    }
+
+    if (!mongoose.Types.ObjectId.isValid(requestId)) {
+      return responseManager.onBadRequest("Invalid requestId format", res);
+    }
+
+    const primary = mongoConnection.useDb(constants.DEFAULT_DB);
+    const ConnectionRequest = primary.model(
+      constants.MODELS.connectionRequest,
+      connectionRequestModel
+    );
+
+    const request = await ConnectionRequest.findById(requestId)
+      .select("senderPhone receiverPhone status createdAt updatedAt")
+      .lean();
+
+    if (!request) {
+      return responseManager.notFoundRequest("Connection request not found", res);
+    }
+
+    return responseManager.onSuccess("Connection request status", request, res);
+
+  } catch (error) {
+    console.error("getConnectionStatus error:", error);
+    return responseManager.internalServer(error, res);
   }
 };
