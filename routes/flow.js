@@ -17,4 +17,7 @@ router.post("/sendConnectionRequest",  flowController.sendConnectionRequest)
 router.post("/acceptConnectionRequest", flowController.acceptConnectionRequest)
 router.post("/getConnectionStatus",    flowController.getConnectionStatus)
 
+// 11za Webhook — Template Button Reply (ACCEPT_ / CANCEL_ postback)
+router.post("/webhook/templateReply",  flowController.templateWebhook)
+
 module.exports = router
