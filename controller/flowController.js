@@ -1311,6 +1311,15 @@ exports.templateWebhook = async (req, res) => {
   // phir response bhejo. 11za 5-10s wait kar sakta hai.
 
   try {
+    // ✅ x-api-key verify karo — 11za header mein bhejta hai
+    const incomingKey = req.headers['x-api-key'] || '';
+    const expectedKey = process.env.WEBHOOK_API_KEY || '';
+
+    if (expectedKey && incomingKey !== expectedKey) {
+      console.warn('[Webhook] Unauthorized — invalid x-api-key:', incomingKey);
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
     const body = req.body;
     console.log('[Webhook] Received:', JSON.stringify(body));
 
@@ -1319,6 +1328,7 @@ exports.templateWebhook = async (req, res) => {
       console.log('[Webhook] Ignoring event:', body?.event);
       return res.status(200).json({ received: true, skipped: true });
     }
+
 
     const payload   = body?.postback?.data || '';
     const fromPhone = (body?.from || '').toString().trim();
