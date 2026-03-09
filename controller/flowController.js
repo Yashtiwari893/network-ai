@@ -803,27 +803,41 @@ exports.getRecommendations = async (req, res) => {
 
     console.log(`[Recs] ${currentUser.phone} | shown=${shownIds.length} | sentReqs=${sentUserIds.length} | frontendExclude=${extraExcludeIds.length} | totalExcluded=${allExcludedIds.length}`);
 
+    console.log(`[Recs] ${currentUser.phone} | Category Filter:`, categoryArray);
+
     // ── Pipeline builder ────────────────────────────────────────────────────────
-    const buildPipeline = (excludeList) => [
-      {
-        $vectorSearch: {
-          index: 'vector_index',
-          path: 'bio_vector',
-          queryVector: queryVec,
-          numCandidates: NUM_CANDIDATES,
-          limit: NUM_CANDIDATES,
-          filter: { category: { $in: categoryArray } }
-        }
-      },
-      { $addFields: { vsScore: { $meta: 'vectorSearchScore' } } },
-      {
-        $match: {
-          _id: { $ne: userObjectId },
-          ...(excludeList.length > 0 ? { _id: { $ne: userObjectId, $nin: excludeList } } : {})
-        }
-      },
-      { $project: { name: 1, link1: 1, link2: 1, phone: 1, bio: 1, bio_vector: 1, category: 1, vsScore: 1 } }
-    ];
+    const buildPipeline = (excludeList) => {
+      const pipeline = [
+        {
+          $vectorSearch: {
+            index: 'vector_index',
+            path: 'bio_vector',
+            queryVector: queryVec,
+            numCandidates: NUM_CANDIDATES,
+            limit: NUM_CANDIDATES
+          }
+        },
+        { $addFields: { vsScore: { $meta: 'vectorSearchScore' } } },
+        {
+          $match: {
+            _id: { $ne: userObjectId }
+          }
+        },
+        { $project: { name: 1, link1: 1, link2: 1, phone: 1, bio: 1, bio_vector: 1, category: 1, vsScore: 1 } }
+      ];
+
+      // Add category filter only if user has categories
+      if (categoryArray.length > 0) {
+        pipeline[0].$vectorSearch.filter = { category: { $in: categoryArray } };
+      }
+
+      // Add NIN exclusion if list is not empty
+      if (excludeList.length > 0) {
+        pipeline[2].$match._id = { $ne: userObjectId, $nin: excludeList };
+      }
+
+      return pipeline;
+    };
 
     // ── Cosine similarity ───────────────────────────────────────────────────────
     const cosine = (a, b) => {
@@ -837,13 +851,14 @@ exports.getRecommendations = async (req, res) => {
     };
 
     const scoreAndPick = (candidates) => {
+      if (!candidates || candidates.length === 0) return [];
       const withSim = candidates.map(c => ({
         ...c,
         similarity: cosine(queryVec, (c.bio_vector || []).map(Number))
       }));
       let filtered = withSim.filter(x => x.similarity >= SIM_THRESHOLD);
       if (!filtered.length) {
-        for (const t of [0.70, 0.65, 0.60]) {
+        for (const t of [0.70, 0.65, 0.60, 0.50]) {
           filtered = withSim.filter(x => x.similarity >= t);
           if (filtered.length) break;
         }
@@ -853,17 +868,28 @@ exports.getRecommendations = async (req, res) => {
     };
 
     // ── First attempt with all exclusions ──────────────────────────────────────
-    let candidates = await User.aggregate(buildPipeline(allExcludedIds));
+    let candidates = [];
+    try {
+      candidates = await User.aggregate(buildPipeline(allExcludedIds));
+    } catch (aggErr) {
+      console.error('[Recs] Aggregate failed! Check Atlas Index:', aggErr.message);
+      // Fallback: search without filter if filter failed
+      if (categoryArray.length > 0) {
+        console.log('[Recs] Retrying without category filter...');
+        const fallbackPipeline = buildPipeline(allExcludedIds);
+        delete fallbackPipeline[0].$vectorSearch.filter;
+        candidates = await User.aggregate(fallbackPipeline);
+      } else {
+        throw aggErr;
+      }
+    }
+
     let recommendations = scoreAndPick(candidates);
 
     // ── No results found ────────────────────────────────────────────────────────
     if (recommendations.length === 0) {
-      console.log(`[Recs] No more recommendations for ${currentUser.phone}`);
-      return res.json({ message: 'No matching profiles found', recommendations: [] });
-    }
-
-    if (recommendations.length === 0) {
-      return res.json({ message: 'No matching profiles found', recommendations: [] });
+      console.log(`[Recs] No matching profiles found for ${currentUser.phone}`);
+      return responseManager.onSuccess('No more recommendations available', [], res);
     }
 
     // ── Persist shown IDs to DB ────────────────────────────────────────────────
