@@ -856,27 +856,10 @@ exports.getRecommendations = async (req, res) => {
     let candidates = await User.aggregate(buildPipeline(allExcludedIds));
     let recommendations = scoreAndPick(candidates);
 
-    // ── Reset cycle: DB-shown exhausted → reset recommendationsShown ───────────
-    //    BUT keep excluding sent-request users — they should never re-appear
-    if (recommendations.length === 0 && shownIds.length > 0) {
-      console.log(`[Recs] Cycle reset for ${currentUser.phone}`);
-      await User.findByIdAndUpdate(currentUser._id, {
-        $set: { recommendationsShown: [], searchCount: 0 }
-      });
-
-      // After reset: only keep sent-request + frontend exclusions
-      const postResetExclude = [
-        ...new Set([
-          ...sentUserIds.map(id => id.toString()),
-          ...extraExcludeIds.map(id => id.toString())
-        ])
-      ]
-        .filter(id => mongoose.Types.ObjectId.isValid(id))
-        .map(id => new mongoose.Types.ObjectId(id));
-
-      candidates = await User.aggregate(buildPipeline(postResetExclude));
-      recommendations = scoreAndPick(candidates);
-      console.log(`[Recs] After reset: ${recommendations.length} found`);
+    // ── No results found ────────────────────────────────────────────────────────
+    if (recommendations.length === 0) {
+      console.log(`[Recs] No more recommendations for ${currentUser.phone}`);
+      return res.json({ message: 'No matching profiles found', recommendations: [] });
     }
 
     if (recommendations.length === 0) {
@@ -1046,11 +1029,11 @@ exports.sendConnectionRequest = async (req, res) => {
         name:         receiverUser.name || "",
         templateName: "ivy_connection_request",
         data: [
-          receiverUser.name         || "",   // VARIABLE_1 → "Hi {{1}},"
-          senderUser.name           || "",   // VARIABLE_2 → "{{2}} wants to connect"
-          senderUser.company_name   || "",   // VARIABLE_3 → "Company: {{3}}"
-          senderUser.bio            || "",   // VARIABLE_4 → "About: {{4}}"
-          senderUser.link1          || ""    // VARIABLE_5 → "Profile: {{5}}"
+          receiverUser.name         || "User", // VARIABLE_1
+          senderUser.name           || "User", // VARIABLE_2
+          senderUser.company_name   || "No Company", // VARIABLE_3
+          senderUser.bio            || "No Bio", // VARIABLE_4
+          senderUser.link1          || ""        // VARIABLE_5
         ],
         buttonValue: [
           `ACCEPT_${newRequest._id}`,   // Button 1: Accept Request
@@ -1190,8 +1173,10 @@ exports.acceptConnectionRequest = async (req, res) => {
     // Button: [Chat Now] → URL = https://wa.me/ + buttonValue (phone number)
     const userAPhone = userA?.phone || request.senderPhone;
     const userBPhone = userB?.phone || request.receiverPhone;
-    const userAName  = userA?.name  || "";
-    const userBName  = userB?.name  || "";
+    const userAName  = userA?.name  || 'User';
+    const userBName  = userB?.name  || 'User';
+
+    console.log(`[Flow] Notifying A (${userAPhone}) and B (${userBPhone}) about acceptance`);
 
     // Both template sends parallel mein — faster response
     const templateResults = await Promise.allSettled([
@@ -1385,12 +1370,14 @@ exports.templateWebhook = async (req, res) => {
 
       const userAPhone = userA?.phone || request.senderPhone;
       const userBPhone = userB?.phone || request.receiverPhone;
-      const userAName  = userA?.name  || '';
-      const userBName  = userB?.name  || '';
+      const userAName  = userA?.name  || 'User';
+      const userBName  = userB?.name  || 'User';
 
-      // Dono ko ivy_match_confirmed bhejo — sab kuch await karo
+      console.log(`[Webhook] Notifying A (${userAPhone}) and B (${userBPhone}) about acceptance`);
+
+      // ── Notify both users parallelly ─────────────────────────────────────────
       const results = await Promise.allSettled([
-        // → User A ko (Chat Now → User B)
+        // → User A (Sender) - Notify that B accepted
         send11zaTemplate({
           sendto:       formatPhoneFor11za(userAPhone),
           name:         userAName,
@@ -1403,7 +1390,7 @@ exports.templateWebhook = async (req, res) => {
           ],
           buttonValue: formatPhoneFor11za(userBPhone)
         }),
-        // → User B ko (Chat Now → User A)
+        // → User B (Receiver) - Confirm their acceptance
         send11zaTemplate({
           sendto:       formatPhoneFor11za(userBPhone),
           name:         userBName,
@@ -1424,8 +1411,6 @@ exports.templateWebhook = async (req, res) => {
           console.error(`[Webhook] ivy_match_confirmed failed for ${who}:`, r.reason?.response?.data || r.reason?.message);
         }
       });
-
-      console.log(`[Webhook] ✅ Match confirmed: ${userAName} ↔ ${userBName}`);
 
       // ✅ Sab kaam ho gaya — ab response bhejo
       return res.status(200).json({
