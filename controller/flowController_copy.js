@@ -15,9 +15,17 @@ exports.checkUserProfile = async (req, res) => {
     if (!phone) {
       return responseManager.onBadRequest("Phone number required", res);
     }
+
+    const phoneStr = phone.toString().trim();
+    const strippedPhone = phoneStr.replace(/^91/, '');
+    const possiblePhones = [phoneStr, strippedPhone];
+    if (strippedPhone.length === 10) {
+      possiblePhones.push(`91${strippedPhone}`);
+    }
+
     const user = await primary
       .model(constants.MODELS.user, userModel)
-      .findOne({ phone: phone })
+      .findOne({ phone: { $in: possiblePhones } })
       .select("name company_name bio interests consent phone link1 link2");
 
     if (user) {
