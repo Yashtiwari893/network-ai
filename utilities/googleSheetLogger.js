@@ -32,6 +32,9 @@ const SHEET_TABS = {
   CONNECTION_REQUESTS:  "ConnectionRequests",
   DAILY_LIMITS:         "DailyLimits",
   SYSTEM_EVENTS:        "SystemEvents",
+  USERS_INVESTORS:      "Investors",
+  USERS_STARTUPS:       "Startups",
+  USERS_OTHERS:         "Others",
 };
 
 /**
@@ -174,6 +177,32 @@ async function logToGoogleSheet(eventType, data) {
         row = [
           "ALL_RECOMMENDATIONS_DONE",
           `Phone: ${data.phone || ""} | Category: ${data.category || ""}`,
+          timestamp,
+        ];
+        break;
+
+      // ── New User Registration ──────────────────────────────────────────
+      case "NEW_USER":
+        const userCategory = Array.isArray(data.category) ? data.category[0] : (data.category || "");
+        const catStr = String(userCategory).toLowerCase();
+        
+        if (catStr.includes("investor")) {
+          sheetTab = SHEET_TABS.USERS_INVESTORS;
+        } else if (catStr.includes("startup") || catStr.includes("founder")) {
+          sheetTab = SHEET_TABS.USERS_STARTUPS;
+        } else {
+          sheetTab = SHEET_TABS.USERS_OTHERS;
+        }
+
+        row = [
+          data.name         || "",
+          data.phone        || "",
+          data.company_name || "",
+          Array.isArray(data.category) ? data.category.join(", ") : (data.category || ""),
+          data.bio          || "",
+          data.link1        || "",
+          data.link2        || "",
+          data.consent      ? "Yes" : "No",
           timestamp,
         ];
         break;

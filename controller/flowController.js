@@ -152,6 +152,18 @@ exports.addUser = async (req, res) => {
       .create(obj);
 
     console.log("User created successfully:", userData._id);
+
+    // ✅ Google Sheet Log (Nom-blocking)
+    logToGoogleSheet("NEW_USER", {
+      name:         userData.name,
+      phone:        userData.phone,
+      company_name: userData.company_name,
+      category:     userData.category,
+      bio:          userData.bio,
+      link1:        userData.link1,
+      link2:        userData.link2,
+      consent:      userData.consent
+    });
     return responseManager.onSuccess("Data added successfully", userData, res);
   } catch (error) {
     console.error("Error adding user:", error?.response?.data || error);
@@ -1140,6 +1152,13 @@ exports.sendConnectionRequest = async (req, res) => {
       console.error("[11za] ivy_connection_request template send failed:", templateErr?.response?.data || templateErr.message);
     }
 
+    // ✅ Google Sheet Log (Nom-blocking)
+    logToGoogleSheet("CONNECTION_REQUEST", {
+      senderPhone:   newRequest.senderPhone,
+      receiverPhone: newRequest.receiverPhone,
+      requestId:     newRequest._id.toString()
+    });
+
     return responseManager.onSuccess("Connection request sent", {
       requestId:     newRequest._id,
       senderPhone:   newRequest.senderPhone,
@@ -1567,6 +1586,13 @@ exports.templateWebhook = async (req, res) => {
         }
       });
 
+      // ✅ Google Sheet Log (Nom-blocking)
+      logToGoogleSheet("REQUEST_ACCEPTED", {
+        senderPhone:   userAPhone,
+        receiverPhone: userBPhone,
+        requestId:     request._id.toString()
+      });
+
       return res.status(200).json({
         received: true,
         action:   'accepted',
@@ -1595,6 +1621,13 @@ exports.templateWebhook = async (req, res) => {
           data:         []
         }).catch(e => console.log('[Webhook] Cancel notify skipped:', e.message));
       }
+
+      // ✅ Google Sheet Log (Nom-blocking)
+      logToGoogleSheet("REQUEST_REJECTED", {
+        senderPhone:   request.senderPhone,
+        receiverPhone: request.receiverPhone,
+        requestId:     request._id.toString()
+      });
 
       return res.status(200).json({ received: true, action: 'cancelled' });
     }
