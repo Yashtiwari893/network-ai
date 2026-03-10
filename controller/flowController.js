@@ -1406,12 +1406,7 @@ exports.templateWebhook = async (req, res) => {
 
     console.log(`[Webhook] payload="${payload}" from="${fromPhone}"`);
 
-    if (mongoConnection.readyState !== 1) {
-      console.log('[Webhook] DB disconnected. Awaiting connection...');
-      await mongoConnection.asPromise().catch(e => console.error('[Webhook] DB connect error:', e.message));
-    }
-
-    const primary = mongoConnection.useDb(constants.DEFAULT_DB, { useCache: true });
+    const primary = mongoConnection.useDb(constants.DEFAULT_DB);
     const ConnectionRequest = primary.model(
       constants.MODELS.connectionRequest,
       connectionRequestModel
