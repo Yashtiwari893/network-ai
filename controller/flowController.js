@@ -1286,7 +1286,7 @@ exports.acceptConnectionRequest = async (req, res) => {
           userBName,    // VARIABLE_3 → "Name: {{3}}"
           formatPhoneFor11za(userBPhone)  // VARIABLE_4 → "Phone: {{4}}" (12-digit display)
         ],
-        buttonValue: formatPhoneFor11za(userBPhone)  // Chat Now → wa.me/userBPhone
+        buttonValue: `https://wa.me/${formatPhoneFor11za(userBPhone)}`  // Chat Now → wa.me/userBPhone
       }),
       // → User B ko bhejo  (Chat Now → User A se baat karo)
       send11zaTemplate({
@@ -1299,7 +1299,7 @@ exports.acceptConnectionRequest = async (req, res) => {
           userAName,    // VARIABLE_3 → "Name: {{3}}"
           formatPhoneFor11za(userAPhone)  // VARIABLE_4 → "Phone: {{4}}" (12-digit display)
         ],
-        buttonValue: formatPhoneFor11za(userAPhone)  // Chat Now → wa.me/userAPhone
+        buttonValue: `https://wa.me/${formatPhoneFor11za(userAPhone)}`  // Chat Now → wa.me/userAPhone
       })
     ]);
 
@@ -1543,7 +1543,7 @@ exports.templateWebhook = async (req, res) => {
             userBName,
             formatPhoneFor11za(userBPhone)
           ],
-          buttonValue: formatPhoneFor11za(userBPhone)
+          buttonValue: `https://wa.me/${formatPhoneFor11za(userBPhone)}`
         }),
         // → User B (Receiver) - Confirm their acceptance
         send11zaTemplate({
@@ -1556,7 +1556,7 @@ exports.templateWebhook = async (req, res) => {
             userAName,
             formatPhoneFor11za(userAPhone)
           ],
-          buttonValue: formatPhoneFor11za(userAPhone)
+          buttonValue: `https://wa.me/${formatPhoneFor11za(userAPhone)}`
         })
       ]);
 
