@@ -153,8 +153,9 @@ exports.addUser = async (req, res) => {
 
     console.log("User created successfully:", userData._id);
 
-    // ✅ Google Sheet Log (Nom-blocking)
-    logToGoogleSheet("NEW_USER", {
+    // ✅ Google Sheet Log (Wait for it specifically in Vercel to ensure entry)
+    console.log(`[Flow] Logging new user to Google Sheet: ${userData.phone} (${userData.name})`);
+    await logToGoogleSheet("NEW_USER", {
       name:         userData.name,
       phone:        userData.phone,
       company_name: userData.company_name,
@@ -163,7 +164,8 @@ exports.addUser = async (req, res) => {
       link1:        userData.link1,
       link2:        userData.link2,
       consent:      userData.consent
-    });
+    }).catch(err => console.error("[GoogleSheet] Async log failed:", err.message));
+
     return responseManager.onSuccess("Data added successfully", userData, res);
   } catch (error) {
     console.error("Error adding user:", error?.response?.data || error);
