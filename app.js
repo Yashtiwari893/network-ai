@@ -20,13 +20,8 @@ app.use(express.static(path.join(__dirname, 'public')));
 app.set('views', path.join(__dirname, 'views'));
 app.set('view engine', 'ejs');
 
-mongoose.connect(process.env.MONGODB_URL)
+// Database connection is managed in utilities/connetion.js
 
-mongoose.connection.once('open', () => {
-  console.log("Well done! , connected with mongoDB database");
-}).on('error', error => {
-  console.log("Oops! database connection error:" + error);
-});
 
 app.use('/', flowRoutes);
 
