@@ -1038,11 +1038,22 @@ exports.sendConnectionRequest = async (req, res) => {
     );
     const User = primary.model(constants.MODELS.user, userModel);
 
+    // Prepare possible phone formats for robust matching
+    const senderStr = senderPhone.trim();
+    const senderStripped = senderStr.replace(/^91/, '');
+    const possibleSenderPhones = [senderStr, senderStripped];
+    if (senderStripped.length === 10) possibleSenderPhones.push(`91${senderStripped}`);
+
+    const receiverStr = receiverPhone.trim();
+    const receiverStripped = receiverStr.replace(/^91/, '');
+    const possibleReceiverPhones = [receiverStr, receiverStripped];
+    if (receiverStripped.length === 10) possibleReceiverPhones.push(`91${receiverStripped}`);
+
     // Verify both users exist
     const [senderUser, receiverUser] = await Promise.all([
       // Fetch full profile for both users — company_name, bio, link1 needed for template
-      User.findOne({ phone: senderPhone.trim() }).select("name phone company_name bio link1").lean(),
-      User.findOne({ phone: receiverPhone.trim() }).select("name phone").lean()
+      User.findOne({ phone: { $in: possibleSenderPhones } }).select("name phone company_name bio link1").lean(),
+      User.findOne({ phone: { $in: possibleReceiverPhones } }).select("name phone").lean()
     ]);
 
     if (!senderUser) {
@@ -1192,7 +1203,10 @@ exports.acceptConnectionRequest = async (req, res) => {
     }
 
     // Security: only the intended receiver can accept
-    if (request.receiverPhone !== receiverPhone.trim()) {
+    const reqPhone = receiverPhone.trim().replace(/^91/, '');
+    const dbPhone = request.receiverPhone.trim().replace(/^91/, '');
+    
+    if (reqPhone !== dbPhone) {
       return responseManager.onBadRequest(
         "You are not the intended receiver of this request",
         res
@@ -1214,12 +1228,20 @@ exports.acceptConnectionRequest = async (req, res) => {
       { new: true }
     );
 
+    // Prepare possible phone formats for robust matching
+    const possibleSenderPhones = [request.senderPhone, request.senderPhone.replace(/^91/, '')];
+    if (possibleSenderPhones[1].length === 10) possibleSenderPhones.push(`91${possibleSenderPhones[1]}`);
+    
+    const possibleReceiverPhones = [request.receiverPhone, request.receiverPhone.replace(/^91/, '')];
+    if (possibleReceiverPhones[1].length === 10) possibleReceiverPhones.push(`91${possibleReceiverPhones[1]}`);
+
+
     // Fetch both users' data for the match confirmed template
     const [userA, userB] = await Promise.all([
-      User.findOne({ phone: request.senderPhone })
+      User.findOne({ phone: { $in: possibleSenderPhones } })
           .select("name phone company_name bio link1 link2 category")
           .lean(),
-      User.findOne({ phone: request.receiverPhone })
+      User.findOne({ phone: { $in: possibleReceiverPhones } })
           .select("name phone company_name bio link1 link2 category")
           .lean()
     ]);
@@ -1424,11 +1446,22 @@ exports.templateWebhook = async (req, res) => {
         $set: { status: 'accepted', acceptedAt: new Date() }
       });
 
+      // Prepare possible phone formats for robust matching
+      const senderStr = request.senderPhone.trim();
+      const senderStripped = senderStr.replace(/^91/, '');
+      const possibleSenderPhones = [senderStr, senderStripped];
+      if (senderStripped.length === 10) possibleSenderPhones.push(`91${senderStripped}`);
+
+      const receiverStr = request.receiverPhone.trim();
+      const receiverStripped = receiverStr.replace(/^91/, '');
+      const possibleReceiverPhones = [receiverStr, receiverStripped];
+      if (receiverStripped.length === 10) possibleReceiverPhones.push(`91${receiverStripped}`);
+
       // Dono users ka data fetch karo
       const [userA, userB] = await Promise.all([
-        User.findOne({ phone: request.senderPhone })
+        User.findOne({ phone: { $in: possibleSenderPhones } })
             .select('name phone company_name bio link1').lean(),
-        User.findOne({ phone: request.receiverPhone })
+        User.findOne({ phone: { $in: possibleReceiverPhones } })
             .select('name phone company_name bio link1').lean()
       ]);
 
