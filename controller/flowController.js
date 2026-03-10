@@ -991,16 +991,25 @@ async function send11zaTemplate({ sendto, name, templateName, data, buttonValue,
     payload.tags = tags;
   }
 
-  console.log(`[11za] Sending template "${templateName}" to ${sendto}`);
+  console.log(`[11za] ▶ Sending template "${templateName}" to ${sendto}`);
+  console.log(`[11za] ▶ Full payload:`, JSON.stringify(payload, null, 2));
 
-  const response = await axios.post(
-    "https://api.11za.in/apis/template/sendTemplate",
-    payload,
-    { headers: { "Content-Type": "application/json" } }
-  );
-
-  console.log(`[11za] Template sent to ${sendto}:`, response.data);
-  return response.data;
+  let response;
+  try {
+    response = await axios.post(
+      "https://api.11za.in/apis/template/sendTemplate",
+      payload,
+      { headers: { "Content-Type": "application/json" } }
+    );
+    console.log(`[11za] ✅ Template "${templateName}" sent to ${sendto}. Response:`, JSON.stringify(response.data));
+    return response.data;
+  } catch (err) {
+    console.error(`[11za] ❌ Template "${templateName}" FAILED for ${sendto}`);
+    console.error(`[11za] ❌ HTTP Status:`, err?.response?.status);
+    console.error(`[11za] ❌ Error Response Body:`, JSON.stringify(err?.response?.data));
+    console.error(`[11za] ❌ Error Message:`, err?.message);
+    throw err; // re-throw so Promise.allSettled can catch it
+  }
 }
 
 /**
