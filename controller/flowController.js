@@ -1487,3 +1487,26 @@ exports.templateWebhook = async (req, res) => {
   }
 };
 
+exports.getDbStatus = async (req, res) => {
+  try {
+    const mongoConnection = require("../utilities/connetion");
+    const constants = require("../utilities/constants");
+    const dbState = mongoConnection.readyState;
+    const states = {
+      0: "disconnected",
+      1: "connected",
+      2: "connecting",
+      3: "disconnecting",
+      99: "uninitialized",
+    };
+
+    return res.json({
+      env_url_exists: !!process.env.MONGODB_URL,
+      db_state: states[dbState] || dbState,
+      database_name: constants.DEFAULT_DB,
+      node_version: process.version,
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+};

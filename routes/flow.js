@@ -20,4 +20,7 @@ router.post("/getConnectionStatus",    flowController.getConnectionStatus)
 // 11za Webhook — Template Button Reply (ACCEPT_ / CANCEL_ postback)
 router.post("/webhook/templateReply",  flowController.templateWebhook)
 
+// Diagnosis Route: check if DB is connected & env variables exist
+router.get("/db-status", flowController.getDbStatus);
+
 module.exports = router
