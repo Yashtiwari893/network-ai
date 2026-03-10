@@ -1412,17 +1412,21 @@ exports.templateWebhook = async (req, res) => {
     const body = req.body;
     console.log('[Webhook] Received:', JSON.stringify(body));
 
-    // Sirf button tap events handle karo
-    if (body?.event !== 'MoMessage::Postback') {
+    // Sirf button tap events handle karo (MoMessage::Postback)
+    // Kuch flow configurations mein event name different ho sakta hai, 
+    // isliye UserResponse/TemplateName ke liye bhi check karenge.
+    if (body?.event !== 'MoMessage::Postback' && !body?.UserResponse) {
       console.log('[Webhook] Ignoring event:', body?.event);
       return res.status(200).json({ received: true, skipped: true });
     }
 
+    let payload      = body?.postback?.data || '';
+    const fromPhone  = (body?.from || '').toString().trim();
+    const userResp   = (body?.UserResponse || '').trim();
+    const tempName   = (body?.TemplateName || '');
+    const contextMsgId = body?.context?.messageId || null;
 
-    const payload   = body?.postback?.data || '';
-    const fromPhone = (body?.from || '').toString().trim();
-
-    console.log(`[Webhook] payload="${payload}" from="${fromPhone}"`);
+    console.log(`[Webhook] payload="${payload}" from="${fromPhone}" UserResponse="${userResp}" TemplateName="${tempName}" ContextMsgId="${contextMsgId}"`);
 
     const primary = mongoConnection.useDb(constants.DEFAULT_DB);
     const ConnectionRequest = primary.model(
@@ -1431,27 +1435,70 @@ exports.templateWebhook = async (req, res) => {
     );
     const User = primary.model(constants.MODELS.user, userModel);
 
-    // ── ACCEPT ──────────────────────────────────────────────────────────────
+    // ── IDENTIFY ACTION & REQUEST ID ───────────────────────────────────────
+    let action = null;
+    let requestId = null;
+
+    // 1. Check Payload prefix
     if (payload.startsWith('ACCEPT_')) {
-      const requestId = payload.replace('ACCEPT_', '').trim();
+      action = 'accept';
+      requestId = payload.replace('ACCEPT_', '').trim();
+    } else if (payload.startsWith('CANCEL_')) {
+      action = 'cancel';
+      requestId = payload.replace('CANCEL_', '').trim();
+    } 
+    // 2. Handle UserResponse format if payload is just an ID or empty
+    else if (userResp === 'Accept Request' || userResp === 'Accept') {
+      action = 'accept';
+      requestId = payload; // Payload might contain the ID
+    } else if (userResp === 'Cancel' || userResp === 'Reject') {
+      action = 'cancel';
+      requestId = payload;
+    }
 
-      if (!mongoose.Types.ObjectId.isValid(requestId)) {
-        console.error('[Webhook] Invalid requestId in ACCEPT payload:', requestId);
-        return res.status(200).json({ received: true, error: 'invalid_request_id' });
-      }
+    // ── FIND THE REQUEST ───────────────────────────────────────────────────
+    let request = null;
 
-      const request = await ConnectionRequest.findById(requestId).lean();
-      if (!request) {
-        console.error('[Webhook] Connection request not found:', requestId);
-        return res.status(200).json({ received: true, error: 'request_not_found' });
-      }
+    // Try finding by requestId if it looks like a valid ID
+    if (requestId && (mongoose.Types.ObjectId.isValid(requestId) || requestId.length > 10)) {
+      request = await ConnectionRequest.findById(requestId).lean();
+      if (request) console.log(`[Webhook] Found request by requestId: ${requestId}`);
+    }
+
+    // Fallback: Try templateMessageId (contextMsgId)
+    if (!request && contextMsgId) {
+      request = await ConnectionRequest.findOne({ templateMessageId: contextMsgId }).lean();
+      if (request) console.log(`[Webhook] Found request by templateMessageId (contextMsgId): ${contextMsgId}`);
+    }
+
+    // Fallback: Try most recent pending request for this receiver
+    if (!request && fromPhone) {
+      const strippedPhone = fromPhone.replace(/^91/, '');
+      const possiblePhones = [fromPhone, strippedPhone];
+      if (strippedPhone.length === 10) possiblePhones.push(`91${strippedPhone}`);
+
+      request = await ConnectionRequest.findOne({ 
+        receiverPhone: { $in: possiblePhones }, 
+        status: 'pending' 
+      }).sort({ createdAt: -1 }).lean();
+      
+      if (request) console.log(`[Webhook] Found most recent pending request for ${fromPhone}`);
+    }
+
+    if (!request) {
+      console.error('[Webhook] Connection request not found for payload/context');
+      return res.status(200).json({ received: true, error: 'request_not_found' });
+    }
+
+    // ── PROCESS ACTION ──────────────────────────────────────────────────────
+    if (action === 'accept') {
       if (request.status !== 'pending') {
         console.log('[Webhook] Already processed, status:', request.status);
         return res.status(200).json({ received: true, status: request.status });
       }
 
       // Status → accepted
-      await ConnectionRequest.findByIdAndUpdate(requestId, {
+      await ConnectionRequest.findByIdAndUpdate(request._id, {
         $set: { status: 'accepted', acceptedAt: new Date() }
       });
 
@@ -1518,38 +1565,24 @@ exports.templateWebhook = async (req, res) => {
         }
       });
 
-      // ✅ Sab kaam ho gaya — ab response bhejo
       return res.status(200).json({
         received: true,
         action:   'accepted',
         userA:    { name: userAName, phone: userAPhone },
         userB:    { name: userBName, phone: userBPhone }
       });
-    }
 
-    // ── CANCEL ──────────────────────────────────────────────────────────────
-    if (payload.startsWith('CANCEL_')) {
-      const requestId = payload.replace('CANCEL_', '').trim();
-
-      if (!mongoose.Types.ObjectId.isValid(requestId)) {
-        console.error('[Webhook] Invalid requestId in CANCEL payload:', requestId);
-        return res.status(200).json({ received: true, error: 'invalid_request_id' });
-      }
-
-      const request = await ConnectionRequest.findById(requestId).lean();
-      if (!request) {
-        return res.status(200).json({ received: true, error: 'request_not_found' });
-      }
+    } else if (action === 'cancel') {
       if (request.status !== 'pending') {
         return res.status(200).json({ received: true, status: request.status });
       }
 
       // Status → rejected
-      await ConnectionRequest.findByIdAndUpdate(requestId, {
+      await ConnectionRequest.findByIdAndUpdate(request._id, {
         $set: { status: 'rejected' }
       });
 
-      console.log('[Webhook] ❌ Request cancelled:', requestId);
+      console.log('[Webhook] ❌ Request cancelled:', request._id);
 
       // Optional: User A ko notify karo
       if (request.senderPhone) {
@@ -1561,19 +1594,18 @@ exports.templateWebhook = async (req, res) => {
         }).catch(e => console.log('[Webhook] Cancel notify skipped:', e.message));
       }
 
-      // ✅ Sab kaam ho gaya — ab response bhejo
       return res.status(200).json({ received: true, action: 'cancelled' });
     }
 
-    // Unknown payload
-    return res.status(200).json({ received: true, skipped: true, payload });
+    // Unknown action or payload
+    return res.status(200).json({ received: true, skipped: true, payload, userResp });
 
   } catch (error) {
     console.error('[Webhook] Unhandled error:', error);
-    // 200 hi bhejo — 11za ko retry nahi karwana
     return res.status(200).json({ received: true, error: 'internal_error' });
   }
 };
+
 
 exports.getDbStatus = async (req, res) => {
   try {
