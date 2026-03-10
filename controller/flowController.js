@@ -3,11 +3,14 @@ const responseManager = require("../utilities/responseManager");
 const flowModel = require("../models/flow.model");
 const userModel = require("../models/user.model");
 const connectionRequestModel = require("../models/connectionRequest.model");
+const seenRecommendationModel = require("../models/seenRecommendation.model"); // NEW
+const dailyLimitModel = require("../models/dailyLimit.model");               // NEW
 const constants = require("../utilities/constants");
 const categoryModel = require("../models/category.model");
 const axios = require("axios");
-const { GoogleGenAI } = require('@google/genai')
+const { GoogleGenAI } = require('@google/genai');
 const mongoose = require("mongoose");
+const { logToGoogleSheet } = require("../utilities/googleSheetLogger");      // NEW
 
 exports.checkUserProfile = async (req, res) => {
   try {
@@ -654,6 +657,10 @@ exports.chatbotSearch = async (req, res) => {
   try {
     const { query, phone, excludeIds } = req.body;
 
+    // ── [DEBUG] Request body log ────────────────────────────────────────────────
+    console.log('\n========== [chatbotSearch DEBUG] ==========');
+    console.log('[DEBUG] Request body:', JSON.stringify({ query, phone, excludeIds }));
+
     if (!query || typeof query !== 'string' || !query.trim()) {
       return responseManager.onBadRequest('Query text required', res);
     }
@@ -662,10 +669,23 @@ exports.chatbotSearch = async (req, res) => {
     const User = primary.model(constants.MODELS.user, userModel);
     const ConnectionRequest = primary.model(constants.MODELS.connectionRequest, connectionRequestModel);
 
+    // ── [DEBUG] Total documents in collection ───────────────────────────────────
+    const totalDocs = await User.countDocuments({});
+    const docsWithVector = await User.countDocuments({ bio_vector: { $exists: true, $ne: null } });
+    console.log(`[DEBUG] Total users in DB: ${totalDocs}`);
+    console.log(`[DEBUG] Users WITH bio_vector: ${docsWithVector}`);
+    console.log(`[DEBUG] Users WITHOUT bio_vector: ${totalDocs - docsWithVector}`);
+
     const queryVec = await main(query);
+
+    // ── [DEBUG] Embedding result ────────────────────────────────────────────────
     if (!Array.isArray(queryVec) || queryVec.length === 0) {
+      console.error('[DEBUG] ❌ Embedding generation FAILED! queryVec is empty or not an array.');
       return responseManager.internalServer(new Error('Embedding generation failed'), res);
     }
+    console.log(`[DEBUG] ✅ Embedding generated. Vector length: ${queryVec.length}`);
+    console.log(`[DEBUG] First 5 values of queryVec: [${queryVec.slice(0, 5).join(', ')}]`);
+    console.log(`[DEBUG] Vector index name: ${constants.VECTOR_INDEX}`);
 
     // ── Layer 1: Frontend seenIds ───────────────────────────────────────────────
     const excludeObjectIds = Array.isArray(excludeIds)
@@ -685,10 +705,13 @@ exports.chatbotSearch = async (req, res) => {
       }).select('receiverPhone').lean();
 
       const sentPhones = sentRequests.map(r => r.receiverPhone).filter(Boolean);
+      console.log(`[DEBUG] Phone provided: ${phone} | Sent requests count: ${sentRequests.length}`);
       if (sentPhones.length > 0) {
         const sentUsers = await User.find({ phone: { $in: sentPhones } }).select('_id').lean();
         sentUserIds = sentUsers.map(u => new mongoose.Types.ObjectId(u._id));
       }
+    } else {
+      console.log('[DEBUG] ⚠️ No phone provided — phone exclusion skipped.');
     }
 
     // ── Merge exclusions ────────────────────────────────────────────────────────
@@ -700,10 +723,15 @@ exports.chatbotSearch = async (req, res) => {
       .filter(id => mongoose.Types.ObjectId.isValid(id))
       .map(id => new mongoose.Types.ObjectId(id));
 
+    console.log(`[DEBUG] excludeIds from frontend: ${excludeObjectIds.length}`);
+    console.log(`[DEBUG] sentUserIds from DB: ${sentUserIds.length}`);
+    console.log(`[DEBUG] Total excluded IDs: ${allExcludedIds.length}`);
+
     const matchConditions = {};
     if (phone) matchConditions.phone = { $ne: phone.toString().trim() };
     if (allExcludedIds.length > 0) matchConditions._id = { $nin: allExcludedIds };
 
+    // ── [DEBUG] Exact MongoDB pipeline ─────────────────────────────────────────
     const pipeline = [
       {
         $vectorSearch: {
@@ -720,7 +748,17 @@ exports.chatbotSearch = async (req, res) => {
       { $project: { name: 1, company_name: 1, phone: 1, category: 1, bio: 1, link1: 1, score: 1 } }
     ];
 
+    console.log('[DEBUG] matchConditions going to $match:', JSON.stringify(matchConditions));
+    console.log('[DEBUG] Running aggregate pipeline...');
+
     const results = await User.aggregate(pipeline, { maxTimeMS: 30000, allowDiskUse: true });
+
+    // ── [DEBUG] Results ─────────────────────────────────────────────────────────
+    console.log(`[DEBUG] Pipeline returned ${results.length} result(s).`);
+    if (results.length > 0) {
+      console.log('[DEBUG] Top result:', JSON.stringify({ name: results[0].name, score: results[0].score, category: results[0].category }));
+    }
+    console.log('========== [chatbotSearch DEBUG END] ==========\n');
 
     if (!results || results.length === 0) {
       return responseManager.onSuccess('No matching profiles found', [], res);
@@ -1510,3 +1548,366 @@ exports.getDbStatus = async (req, res) => {
     return res.status(500).json({ error: error.message });
   }
 };
+
+
+// =============================================================================
+// RECOMMENDATION ENGINE — getNextRecommendation
+// =============================================================================
+
+/**
+ * POST /getNextRecommendation
+ * Body: { phone, category, excludeIds[] }
+ *
+ * 7-Step Filtering Logic:
+ *   Step 1.  Daily limit check (max 5/day)
+ *   Step 2.  Seen IDs from seen_recommendations collection
+ *   Step 3.  Sent request IDs from connection_requests collection
+ *   Step 4.  Frontend excludeIds (chatbot se pass hote hain)
+ *   Step 5.  Merge sab exclusions into one Set
+ *   Step 6.  Check if ALL profiles exhausted → "Thank You" message (NO loop)
+ *   Step 7+. Vector search → result → save seen + increment counters
+ *
+ * Response Data.status values:
+ *   "daily_limit_reached"     → 5 recommendations aaj ho gaye
+ *   "no_more_recommendations" → Saare profiles dekhe ja chuke hain
+ *   "recommendation_found"    → Profile mila, Data.recommendation mein hai
+ */
+exports.getNextRecommendation = async (req, res) => {
+  try {
+    const { phone, category, excludeIds = [] } = req.body;
+
+    // ─── Basic Validation ────────────────────────────────────────────────────
+    if (!phone || !phone.toString().trim()) {
+      return responseManager.onBadRequest("phone is required", res);
+    }
+    if (!category || !category.toString().trim()) {
+      return responseManager.onBadRequest("category is required", res);
+    }
+
+    const cleanPhone    = phone.toString().trim();
+    const cleanCategory = category.toString().trim();
+
+    const primary           = mongoConnection.useDb(constants.DEFAULT_DB);
+    const User              = primary.model(constants.MODELS.user, userModel);
+    const ConnectionRequest = primary.model(constants.MODELS.connectionRequest, connectionRequestModel);
+    const SeenRec           = primary.model(constants.MODELS.seenRecommendation, seenRecommendationModel);
+    const DailyLimit        = primary.model(constants.MODELS.dailyLimit, dailyLimitModel);
+
+    // ─── STEP 1: Daily Limit Check ───────────────────────────────────────────
+    // Aaj ki date — "YYYY-MM-DD" format
+    const today      = new Date().toISOString().split("T")[0];
+    const limitDoc   = await DailyLimit.findOne({ phone: cleanPhone, date: today }).lean();
+    const todayCount = limitDoc?.count || 0;
+
+    if (todayCount >= constants.DAILY_RECOMMENDATION_LIMIT) {
+      console.log(`[getNextRec] Daily limit reached for ${cleanPhone} — count: ${todayCount}`);
+      // Google Sheet log (non-blocking — await nahi karo)
+      logToGoogleSheet("DAILY_LIMIT_REACHED", {
+        phone: cleanPhone, date: today, count: todayCount
+      });
+      return responseManager.onSuccess("daily_limit_reached", {
+        status:     "daily_limit_reached",
+        message:    `Aaj ke ${constants.DAILY_RECOMMENDATION_LIMIT} recommendations ho gaye hain! Kal dobara aayein. 🙏`,
+        dailyCount: todayCount,
+        limit:      constants.DAILY_RECOMMENDATION_LIMIT,
+        isEnd:      false
+      }, res);
+    }
+
+    // ─── STEP 2: Seen Profile IDs (DB se) ────────────────────────────────────
+    // seen_recommendations → viewerPhone ke saare seenProfileId fetch karo
+    const seenDocs = await SeenRec
+      .find({ viewerPhone: cleanPhone })
+      .select("seenProfileId")
+      .lean();
+    const seenObjectIds = seenDocs
+      .filter(d => mongoose.Types.ObjectId.isValid(d.seenProfileId))
+      .map(d => new mongoose.Types.ObjectId(d.seenProfileId));
+
+    console.log(`[getNextRec] ${cleanPhone} | DB seen count: ${seenObjectIds.length}`);
+
+    // ─── STEP 3: Sent Connection Request Profile IDs ──────────────────────────
+    // Jo users ko request send ho chuki hai (pending ya accepted) unhe exclude karo
+    const sentRequests = await ConnectionRequest.find({
+      senderPhone: cleanPhone,
+      status:      { $in: ["pending", "accepted"] }
+    }).select("receiverPhone").lean();
+
+    let sentUserObjectIds = [];
+    if (sentRequests.length > 0) {
+      const sentPhones = sentRequests.map(r => r.receiverPhone).filter(Boolean);
+      const sentUsers  = await User.find({ phone: { $in: sentPhones } }).select("_id").lean();
+      sentUserObjectIds = sentUsers.map(u => new mongoose.Types.ObjectId(u._id));
+    }
+    console.log(`[getNextRec] ${cleanPhone} | Sent requests to exclude: ${sentUserObjectIds.length}`);
+
+    // ─── STEP 4: Frontend excludeIds ─────────────────────────────────────────
+    // 11za chatbot ke current session mein jo IDs already dikhaye unhe bhi exclude karo
+    const frontendExcludeIds = Array.isArray(excludeIds)
+      ? excludeIds
+          .flatMap(id => String(id).split(","))
+          .map(id => id.trim())
+          .filter(id => mongoose.Types.ObjectId.isValid(id))
+          .map(id => new mongoose.Types.ObjectId(id))
+      : [];
+
+    // ─── STEP 5: Merge ALL Exclusions ────────────────────────────────────────
+    // Set use karo to automatically deduplicate
+    const allExcludedSet = new Set([
+      ...seenObjectIds.map(id => id.toString()),
+      ...sentUserObjectIds.map(id => id.toString()),
+      ...frontendExcludeIds.map(id => id.toString())
+    ]);
+    const allExcludedIds = [...allExcludedSet]
+      .filter(id => mongoose.Types.ObjectId.isValid(id))
+      .map(id => new mongoose.Types.ObjectId(id));
+
+    console.log(`[getNextRec] ${cleanPhone} | Category: ${cleanCategory} | Total excluded: ${allExcludedIds.length}`);
+
+    // ─── STEP 6: Check if ALL Profiles Exhausted ─────────────────────────────
+    // Total available profiles count karo is category mein (excluding self)
+    // Agar excluded >= total → saari recommendations dekh li hain → "Thank You"
+    const totalAvailable = await User.countDocuments({
+      phone:    { $ne: cleanPhone },
+      consent:  true,
+      category: { $in: [cleanCategory] }
+    });
+
+    console.log(`[getNextRec] Total available in "${cleanCategory}": ${totalAvailable} | Excluded: ${allExcludedIds.length}`);
+
+    if (totalAvailable === 0 || allExcludedIds.length >= totalAvailable) {
+      console.log(`[getNextRec] ✅ All recommendations exhausted for ${cleanPhone}`);
+      logToGoogleSheet("ALL_RECOMMENDATIONS_DONE", {
+        phone: cleanPhone, category: cleanCategory
+      });
+      return responseManager.onSuccess("no_more_recommendations", {
+        status:  "no_more_recommendations",
+        message: "🙏 Thank You! Aap saare available profiles dekh chuke hain. Naye members join hone par hum aapko dobara recommend karenge.",
+        isEnd:   true
+      }, res);
+    }
+
+    // ─── STEP 7: Get Current User's bio_vector ────────────────────────────────
+    const currentUser = await User
+      .findOne({ phone: cleanPhone })
+      .select("bio_vector")
+      .lean();
+
+    const queryVec = Array.isArray(currentUser?.bio_vector) && currentUser.bio_vector.length > 0
+      ? currentUser.bio_vector.map(Number)
+      : null;
+
+    // ─── STEP 8A: Vector Search (Primary — Semantic Similarity) ──────────────
+    let result = null;
+
+    if (queryVec) {
+      try {
+        const pipeline = [
+          {
+            $vectorSearch: {
+              index:         constants.VECTOR_INDEX,
+              path:          "bio_vector",
+              queryVector:   queryVec,
+              numCandidates: 100,
+              limit:         20
+            }
+          },
+          {
+            $match: {
+              _id:      { $nin: allExcludedIds },
+              phone:    { $ne: cleanPhone },
+              consent:  true,
+              category: { $in: [cleanCategory] }
+            }
+          },
+          { $limit: 1 },
+          {
+            $project: {
+              name: 1, company_name: 1, phone: 1,
+              bio: 1, link1: 1, link2: 1, category: 1
+            }
+          }
+        ];
+
+        const vectorResults = await User.aggregate(pipeline, { maxTimeMS: 15000 });
+        result = vectorResults[0] || null;
+        if (result) {
+          console.log(`[getNextRec] ✅ Vector search found: ${result.name} (${result.phone})`);
+        }
+      } catch (vecErr) {
+        console.error("[getNextRec] Vector search error, will try fallback:", vecErr.message);
+      }
+    }
+
+    // ─── STEP 8B: Fallback — Regular Query ───────────────────────────────────
+    // Vector search fail hua ya koi embedding nahi toh regular MongoDB query
+    if (!result) {
+      console.log(`[getNextRec] Using fallback regular query for ${cleanPhone}`);
+      result = await User.findOne({
+        _id:      { $nin: allExcludedIds },
+        phone:    { $ne: cleanPhone },
+        consent:  true,
+        category: { $in: [cleanCategory] }
+      })
+        .sort({ searchCount: 1 })  // Sabse kam recommended profile pehle
+        .select("name company_name phone bio link1 link2 category")
+        .lean();
+
+      if (result) {
+        console.log(`[getNextRec] ✅ Fallback found: ${result.name} (${result.phone})`);
+      }
+    }
+
+    // ─── STEP 9: No Result Even After Fallback ────────────────────────────────
+    if (!result) {
+      console.log(`[getNextRec] ❌ No result found even after fallback — all exhausted for ${cleanPhone}`);
+      logToGoogleSheet("ALL_RECOMMENDATIONS_DONE", {
+        phone: cleanPhone, category: cleanCategory
+      });
+      return responseManager.onSuccess("no_more_recommendations", {
+        status:  "no_more_recommendations",
+        message: "🙏 Thank You! Aap saare available profiles dekh chuke hain. Naye members join hone par hum aapko dobara recommend karenge.",
+        isEnd:   true
+      }, res);
+    }
+
+    // ─── STEP 10: Mark as Seen ────────────────────────────────────────────────
+    // upsert: true → agar already seen hai toh duplicate create nahi hoga
+    // $setOnInsert → sirf first insert pe fields set honge
+    await SeenRec.findOneAndUpdate(
+      { viewerPhone: cleanPhone, seenProfileId: result._id },
+      {
+        $setOnInsert: {
+          viewerPhone:      cleanPhone,
+          seenProfileId:    result._id,
+          seenProfilePhone: result.phone,
+          category:         cleanCategory,
+          seenAt:           new Date()
+        }
+      },
+      { upsert: true, new: true }
+    );
+
+    // ─── STEP 11: Increment Daily Limit Counter ───────────────────────────────
+    // upsert: true → pehli baar document nahi toh create karo
+    await DailyLimit.findOneAndUpdate(
+      { phone: cleanPhone, date: today },
+      { $inc: { count: 1 } },
+      { upsert: true, new: true }
+    );
+
+    // ─── STEP 12: Increment Profile's searchCount ─────────────────────────────
+    await User.updateOne(
+      { _id: result._id },
+      { $inc: { searchCount: 1 } }
+    );
+
+    // ─── STEP 13: Log to Google Sheet (non-blocking) ──────────────────────────
+    logToGoogleSheet("SEEN_RECOMMENDATION", {
+      viewerPhone:      cleanPhone,
+      seenProfilePhone: result.phone,
+      seenProfileId:    result._id.toString(),
+      category:         cleanCategory,
+      timestamp:        new Date().toISOString()
+    });
+
+    console.log(`[getNextRec] ✅ Returning: ${result.name} to ${cleanPhone} | Today: ${todayCount + 1}/${constants.DAILY_RECOMMENDATION_LIMIT}`);
+
+    return responseManager.onSuccess("recommendation_found", {
+      status:         "recommendation_found",
+      recommendation: result,
+      dailyCount:     todayCount + 1,
+      limit:          constants.DAILY_RECOMMENDATION_LIMIT,
+      isEnd:          false
+    }, res);
+
+  } catch (error) {
+    console.error("[getNextRecommendation] Error:", error);
+    return responseManager.internalServer(error, res);
+  }
+};
+
+
+// =============================================================================
+// DAILY LIMIT CHECK — checkDailyLimit
+// =============================================================================
+
+/**
+ * POST /checkDailyLimit
+ * Body: { phone }
+ *
+ * 11za chatbot ke start mein check karo ki aaj kitni recommendations baaki hain.
+ *
+ * Response Data:
+ *   { phone, date, todayCount, limit: 5, remaining, limitReached: bool }
+ */
+exports.checkDailyLimit = async (req, res) => {
+  try {
+    const { phone } = req.body;
+    if (!phone) {
+      return responseManager.onBadRequest("phone is required", res);
+    }
+
+    const cleanPhone = phone.toString().trim();
+    const today      = new Date().toISOString().split("T")[0];
+    const primary    = mongoConnection.useDb(constants.DEFAULT_DB);
+    const DailyLimit = primary.model(constants.MODELS.dailyLimit, dailyLimitModel);
+
+    const limitDoc   = await DailyLimit.findOne({ phone: cleanPhone, date: today }).lean();
+    const todayCount = limitDoc?.count || 0;
+    const remaining  = Math.max(0, constants.DAILY_RECOMMENDATION_LIMIT - todayCount);
+
+    return responseManager.onSuccess("Daily limit status", {
+      phone:        cleanPhone,
+      date:         today,
+      todayCount,
+      limit:        constants.DAILY_RECOMMENDATION_LIMIT,
+      remaining,
+      limitReached: todayCount >= constants.DAILY_RECOMMENDATION_LIMIT
+    }, res);
+
+  } catch (error) {
+    console.error("[checkDailyLimit] Error:", error);
+    return responseManager.internalServer(error, res);
+  }
+};
+
+
+// =============================================================================
+// SEEN COUNT — getSeenCount (Debugging / Analytics)
+// =============================================================================
+
+/**
+ * POST /getSeenCount
+ * Body: { phone, category (optional) }
+ *
+ * Kitne profiles dekhe gaye hain total — analytics aur debugging ke liye.
+ */
+exports.getSeenCount = async (req, res) => {
+  try {
+    const { phone, category } = req.body;
+    if (!phone) {
+      return responseManager.onBadRequest("phone is required", res);
+    }
+
+    const cleanPhone = phone.toString().trim();
+    const primary    = mongoConnection.useDb(constants.DEFAULT_DB);
+    const SeenRec    = primary.model(constants.MODELS.seenRecommendation, seenRecommendationModel);
+
+    const query = { viewerPhone: cleanPhone };
+    if (category) query.category = category.toString().trim();
+
+    const seenCount = await SeenRec.countDocuments(query);
+
+    return responseManager.onSuccess("Seen count", {
+      phone: cleanPhone,
+      category: category || "all",
+      seenCount
+    }, res);
+
+  } catch (error) {
+    console.error("[getSeenCount] Error:", error);
+    return responseManager.internalServer(error, res);
+  }
+};
+

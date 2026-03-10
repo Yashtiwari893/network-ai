@@ -1,0 +1,905 @@
+# 🏗️ Networking Chatbot — Complete System Architecture
+
+> **Stack:** Node.js + Express.js | MongoDB Atlas (Vector Search) | Google Sheets API | 11za WhatsApp Platform  
+> **Project:** `d:\VectorSearch - Copy` (existing codebase ke upar build hoga)
+
+---
+
+## 📐 1. Complete System Architecture Overview
+
+```mermaid
+flowchart TD
+    A[WhatsApp User] -->|Message| B(11za WhatsApp Platform)
+    B -->|Webhook POST| C[Express.js Backend\napp.js / routes/flow.js]
+    C --> D{Controller\nflowController.js}
+
+    D --> E[Recommendation Engine]
+    D --> F[Connection Request Service]
+    D --> G[Notification Service]
+
+    E --> H[(MongoDB Atlas\nVector Search)]
+    F --> H
+    G --> I[11za Template Message API]
+
+    E --> J[Google Sheets Logger]
+    F --> J
+
+    H --> K[users collection]
+    H --> L[seen_recommendations collection]
+    H --> M[connection_requests collection]
+    H --> N[daily_limits collection]
+```
+
+---
+
+## 🗄️ 2. MongoDB Database Schema (Complete)
+
+### 2.1 `users` Collection
+
+```javascript
+// models/user.model.js (Enhanced Schema)
+{
+  _id: ObjectId,
+  
+  // Basic Profile
+  name: String,                    // "Rahul Sharma"
+  phone: String,                   // "9876543210" (10-digit, without 91)
+  company_name: String,            // "TechStartup Pvt Ltd"
+  bio: String,                     // Free-text bio for vector search
+  bio_vector: [Number],            // Gemini embedding (3072 dimensions)
+  
+  // Categories: "Startup" | "Investor" | "Others"
+  category: [String],              // ["Startup", "Investor"]
+  
+  // Links
+  link1: String,                   // LinkedIn / website
+  link2: String,                   // Portfolio / other link
+  
+  // Consent
+  consent: Boolean,                // true = visible in recommendations
+  
+  // Metadata
+  searchCount: Number,             // Kitni baar recommend hua (default: 0)
+  createdAt: Date,
+  updatedAt: Date
+}
+
+// Indexes:
+// { phone: 1 }            — unique, fast lookup
+// { category: 1 }         — category filter
+// { consent: 1 }          — only consented users recommend hone chahiye
+// Vector Index: bio_vector — Atlas Vector Search index
+```
+
+---
+
+### 2.2 `seen_recommendations` Collection ⚡ **[NEW — CORE LOGIC]**
+
+> **Ye collection sabse important hai.** Isme track hoga ki kaunse user ne kaunse profile dekhe.
+
+```javascript
+// models/seenRecommendation.model.js (NEW FILE BANANA HAI)
+{
+  _id: ObjectId,
+  
+  viewerPhone: String,             // Jis user ne dekha — "9876543210"
+  seenProfileId: ObjectId,         // Jo profile dekhi — users._id
+  seenProfilePhone: String,        // Quick lookup ke liye
+  category: String,                // "Startup" | "Investor" | "Others"
+  
+  seenAt: Date,                    // Kab dekha (timestamps se)
+  createdAt: Date,
+  updatedAt: Date
+}
+
+// Indexes:
+// Compound: { viewerPhone: 1, seenProfileId: 1 } — UNIQUE (duplicate prevent)
+// { viewerPhone: 1, category: 1 }                — category-wise filter
+// { viewerPhone: 1, seenAt: 1 }                  — daily limit check ke liye
+// TTL Index optional: { seenAt: 1 } with expireAfterSeconds (agar reset chahiye)
+```
+
+---
+
+### 2.3 `connection_requests` Collection
+
+> Yeh already exist karta hai tumhare codebase mein. Thoda enhance karenge.
+
+```javascript
+// models/connectionRequest.model.js (Existing — Enhanced)
+{
+  _id: ObjectId,
+  
+  senderPhone: String,             // User A — "9876543210"
+  receiverPhone: String,           // User B — "9123456789"
+  
+  // Status lifecycle: pending → accepted | rejected
+  status: {
+    type: String,
+    enum: ["pending", "accepted", "rejected"],
+    default: "pending"
+  },
+  
+  // 11za Template Tracking
+  templateMessageId: String,       // 11za ka messageId (notification track karne ke liye)
+  
+  // Timestamps
+  acceptedAt: Date,                // Jab accept hua
+  rejectedAt: Date,                // Jab reject hua
+  createdAt: Date,
+  updatedAt: Date
+}
+
+// Indexes:
+// { senderPhone: 1, receiverPhone: 1 } — UNIQUE (duplicate request prevent)
+// { senderPhone: 1, status: 1 }        — chatbotSearch mein exclusion ke liye
+// { receiverPhone: 1, status: 1 }      — incoming requests dekhe ke liye
+```
+
+---
+
+### 2.4 `daily_limits` Collection ⚡ **[NEW]**
+
+> Ek user ek din mein maximum 5 recommendations dekh sakta hai — isko track karne ke liye.
+
+```javascript
+// models/dailyLimit.model.js (NEW FILE BANANA HAI)
+{
+  _id: ObjectId,
+  
+  phone: String,                   // User ka phone — "9876543210"
+  date: String,                    // "2024-03-10" (YYYY-MM-DD format)
+  count: Number,                   // Aaj kitne dekhe (default: 0)
+  
+  createdAt: Date,
+  updatedAt: Date
+}
+
+// Indexes:
+// Compound UNIQUE: { phone: 1, date: 1 } — ek user ka ek din mein ek hi record
+// TTL Index: { createdAt: 1 } expireAfterSeconds: 604800 (7 days auto-cleanup)
+```
+
+---
+
+## 🔧 3. Recommendation Filtering Logic — Step by Step
+
+```
+getNextRecommendation(userPhone, category)
+│
+├── Step 1: DAILY LIMIT CHECK
+│   └── daily_limits.findOne({ phone, date: today })
+│       ├── count >= 5? → Return "Daily limit reached" message
+│       └── count < 5? → Continue
+│
+├── Step 2: GET SEEN IDs
+│   └── seen_recommendations.find({ viewerPhone: userPhone })
+│       └── .select('seenProfileId') → seenIds[] array
+│
+├── Step 3: GET SENT REQUEST IDs  
+│   └── connection_requests.find({ senderPhone: userPhone, status: {$in: ['pending','accepted']} })
+│       └── Map receiverPhone → User._id → sentUserIds[] array
+│
+├── Step 4: MERGE ALL EXCLUSIONS
+│   └── allExcludedIds = [...seenIds, ...sentUserIds, userOwnId]
+│
+├── Step 5: VECTOR SEARCH QUERY
+│   └── $vectorSearch → bio_vector
+│       ├── Filter: _id: { $nin: allExcludedIds }
+│       ├── Filter: category: { $in: [requestedCategory] }
+│       ├── Filter: consent: true
+│       └── Limit: 1 result
+│
+├── Step 6: NO RESULTS CHECK
+│   └── results.length === 0?
+│       ├── Check: Kya saari recommendations dekh li hain?
+│       │   └── users.countDocuments({ category, consent:true }) === seenIds.length?
+│       │       └── YES → Return "Thank You / No More Recommendations" message
+│       │                  (DO NOT reset loop)
+│       └── Partial miss → Return same "No more available" message
+│
+└── Step 7: SAVE SEEN + INCREMENT COUNTER
+    ├── seen_recommendations.insertOne({ viewerPhone, seenProfileId, category })
+    ├── daily_limits.findOneAndUpdate({ phone, date }, { $inc: { count: 1 } }, { upsert: true })
+    └── users.updateOne({ _id: result._id }, { $inc: { searchCount: 1 } })
+```
+
+---
+
+## 👁️ 4. Seen ID Tracking System — Full Implementation
+
+### 4.1 Model File (Banana Hai)
+
+```javascript
+// models/seenRecommendation.model.js
+const mongoose = require("mongoose");
+const mongoosePaginate = require("mongoose-paginate-v2");
+
+const schema = new mongoose.Schema(
+  {
+    viewerPhone:       { type: String, required: true, trim: true },
+    seenProfileId:     { type: mongoose.Schema.Types.ObjectId, required: true, ref: "users" },
+    seenProfilePhone:  { type: String, trim: true },
+    category:          { type: String, trim: true },
+    seenAt:            { type: Date, default: Date.now }
+  },
+  { timestamps: true, strict: false }
+);
+
+// CRITICAL: Duplicate prevent karne ke liye compound unique index
+schema.index({ viewerPhone: 1, seenProfileId: 1 }, { unique: true });
+schema.index({ viewerPhone: 1, category: 1 });
+schema.index({ viewerPhone: 1, seenAt: 1 });
+
+schema.plugin(mongoosePaginate);
+module.exports = schema;
+```
+
+### 4.2 Tracking Flow (Controller mein)
+
+```javascript
+// Step A: Seen IDs fetch karo (query se exclude karne ke liye)
+async function getSeenProfileIds(viewerPhone, primary) {
+  const SeenRec = primary.model("seen_recommendations", seenRecommendationModel);
+  const seenDocs = await SeenRec.find({ viewerPhone })
+    .select("seenProfileId")
+    .lean();
+  return seenDocs.map(d => new mongoose.Types.ObjectId(d.seenProfileId));
+}
+
+// Step B: Recommendation show hone ke baad save karo
+async function markAsSeen(viewerPhone, seenProfile, category, primary) {
+  const SeenRec = primary.model("seen_recommendations", seenRecommendationModel);
+  await SeenRec.findOneAndUpdate(
+    { viewerPhone, seenProfileId: seenProfile._id },
+    { 
+      $setOnInsert: {
+        viewerPhone,
+        seenProfileId: seenProfile._id,
+        seenProfilePhone: seenProfile.phone,
+        category,
+        seenAt: new Date()
+      }
+    },
+    { upsert: true, new: true }
+  );
+}
+
+// Step C: MongoDB query mein exclude karo
+const pipeline = [
+  {
+    $vectorSearch: {
+      index: constants.VECTOR_INDEX,
+      path: "bio_vector",
+      queryVector: queryVec,
+      numCandidates: 100,
+      limit: 20
+    }
+  },
+  {
+    $match: {
+      _id: { $nin: allExcludedIds },     // ← Seen IDs yahan exclude honge
+      consent: true,
+      category: { $in: [requestedCategory] }
+    }
+  },
+  { $limit: 1 },
+  { $project: { name: 1, company_name: 1, phone: 1, bio: 1, link1: 1, link2: 1, category: 1 } }
+];
+```
+
+---
+
+## 🔄 5. Connection Request Status Management
+
+### 5.1 Status Lifecycle
+
+```
+User A sends request
+        │
+        ▼
+[status: "pending"] ──→ 11za template → User B ko notification
+        │
+   User B responds
+   ┌────┴────┐
+   ▼         ▼
+[accepted] [rejected]
+   │
+   ▼
+User A ko confirmation template
+```
+
+### 5.2 API Functions
+
+```javascript
+// ── Send Connection Request ──────────────────────────────────────────
+exports.sendConnectionRequest = async (req, res) => {
+  const { senderPhone, receiverPhone } = req.body;
+  const primary = mongoConnection.useDb(constants.DEFAULT_DB);
+  const ConnectionRequest = primary.model(constants.MODELS.connectionRequest, connectionRequestModel);
+
+  // Duplicate check
+  const existing = await ConnectionRequest.findOne({ senderPhone, receiverPhone });
+  if (existing) {
+    return responseManager.onBadRequest("Request already sent", res);
+  }
+
+  // MongoDB mein insert
+  const request = await ConnectionRequest.create({
+    senderPhone,
+    receiverPhone,
+    status: "pending"
+  });
+
+  // Google Sheet mein log karo
+  await logToGoogleSheet("CONNECTION_REQUEST", {
+    senderPhone, receiverPhone,
+    status: "pending",
+    requestId: request._id.toString(),
+    timestamp: new Date().toISOString()
+  });
+
+  // 11za template — User B ko notification
+  const templateMsgId = await send11zaTemplate({
+    to: receiverPhone,
+    template: "ivy_connection_request",  // tumhara existing template name
+    params: { senderName: senderPhone }
+  });
+
+  // templateMessageId save karo
+  await ConnectionRequest.updateOne(
+    { _id: request._id },
+    { $set: { templateMessageId: templateMsgId } }
+  );
+
+  return responseManager.onSuccess("Connection request sent", request, res);
+};
+
+// ── Accept Connection Request ────────────────────────────────────────
+exports.acceptConnectionRequest = async (req, res) => {
+  const { senderPhone, receiverPhone } = req.body;
+  const primary = mongoConnection.useDb(constants.DEFAULT_DB);
+  const ConnectionRequest = primary.model(constants.MODELS.connectionRequest, connectionRequestModel);
+
+  const updated = await ConnectionRequest.findOneAndUpdate(
+    { senderPhone, receiverPhone, status: "pending" },
+    { $set: { status: "accepted", acceptedAt: new Date() } },
+    { new: true }
+  );
+
+  if (!updated) {
+    return responseManager.notFoundRequest("Request not found or already processed", res);
+  }
+
+  // Google Sheet update karo
+  await logToGoogleSheet("REQUEST_ACCEPTED", {
+    senderPhone, receiverPhone,
+    status: "accepted",
+    requestId: updated._id.toString(),
+    acceptedAt: new Date().toISOString()
+  });
+
+  // 11za template — User A ko confirmation
+  await send11zaTemplate({
+    to: senderPhone,
+    template: "ivy_request_accepted",
+    params: { receiverName: receiverPhone }
+  });
+
+  return responseManager.onSuccess("Request accepted", updated, res);
+};
+
+// ── Reject Connection Request ────────────────────────────────────────
+exports.rejectConnectionRequest = async (req, res) => {
+  const { senderPhone, receiverPhone } = req.body;
+  const primary = mongoConnection.useDb(constants.DEFAULT_DB);
+  const ConnectionRequest = primary.model(constants.MODELS.connectionRequest, connectionRequestModel);
+
+  const updated = await ConnectionRequest.findOneAndUpdate(
+    { senderPhone, receiverPhone, status: "pending" },
+    { $set: { status: "rejected", rejectedAt: new Date() } },
+    { new: true }
+  );
+
+  // Google Sheet log
+  await logToGoogleSheet("REQUEST_REJECTED", { senderPhone, receiverPhone, status: "rejected" });
+
+  return responseManager.onSuccess("Request rejected", updated, res);
+};
+```
+
+---
+
+## 📋 6. Google Sheets Logging Integration
+
+### 6.1 Logger Utility (Banana Hai)
+
+```javascript
+// utilities/googleSheetLogger.js
+const { google } = require("googleapis");
+
+const auth = new google.auth.GoogleAuth({
+  credentials: JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON),
+  scopes: ["https://www.googleapis.com/auth/spreadsheets"]
+});
+
+const SPREADSHEET_ID = process.env.GOOGLE_SHEET_ID;
+
+// Sheet tabs mapping
+const SHEETS = {
+  SEEN_RECOMMENDATIONS: "SeenRecommendations",
+  CONNECTION_REQUESTS: "ConnectionRequests",
+  DAILY_LIMITS: "DailyLimits"
+};
+
+async function logToGoogleSheet(eventType, data) {
+  try {
+    const client = await auth.getClient();
+    const sheets = google.sheets({ version: "v4", auth: client });
+
+    let sheetName, row;
+
+    switch (eventType) {
+      case "SEEN_RECOMMENDATION":
+        sheetName = SHEETS.SEEN_RECOMMENDATIONS;
+        row = [data.viewerPhone, data.seenProfilePhone, data.category, data.timestamp];
+        break;
+
+      case "CONNECTION_REQUEST":
+      case "REQUEST_ACCEPTED":
+      case "REQUEST_REJECTED":
+        sheetName = SHEETS.CONNECTION_REQUESTS;
+        row = [data.senderPhone, data.receiverPhone, data.status, data.requestId, data.timestamp || new Date().toISOString()];
+        break;
+
+      case "DAILY_LIMIT_REACHED":
+        sheetName = SHEETS.DAILY_LIMITS;
+        row = [data.phone, data.date, data.count, data.timestamp];
+        break;
+    }
+
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: SPREADSHEET_ID,
+      range: `${sheetName}!A:Z`,
+      valueInputOption: "USER_ENTERED",
+      resource: { values: [row] }
+    });
+
+    console.log(`[GoogleSheet] ✅ Logged: ${eventType}`);
+  } catch (err) {
+    console.error(`[GoogleSheet] ❌ Failed to log ${eventType}:`, err.message);
+    // Sheet fail ho toh bhi main flow nahi rukna chahiye — silent fail
+  }
+}
+
+module.exports = { logToGoogleSheet };
+```
+
+### 6.2 Google Sheet Structure
+
+| Sheet Tab | Columns |
+|-----------|---------|
+| `SeenRecommendations` | ViewerPhone \| SeenProfilePhone \| Category \| Timestamp |
+| `ConnectionRequests` | SenderPhone \| ReceiverPhone \| Status \| RequestId \| Timestamp |
+| `DailyLimits` | Phone \| Date \| Count \| Timestamp |
+
+---
+
+## 🤖 7. Complete Chatbot Flow Logic (11za WhatsApp)
+
+```
+USER → "Main networking recommendations dekhna chahta hoon"
+         │
+         ▼
+    [NODE: GET_USER_PROFILE]
+    API: POST /checkUserProfile { phone }
+    ├── Profile exists? Continue
+    └── No profile? → "Pehle register karein"
+         │
+         ▼
+    [NODE: GET_CATEGORY]
+    API: POST /getCategoryByUser { phone }
+    Returns: user.category[] e.g. ["Startup", "Investor"]
+         │
+         ▼
+    [NODE: CHECK_DAILY_LIMIT]
+    API: POST /checkDailyLimit { phone }
+    ├── count >= 5? → "Aaj ke 5 recommendations ho gaye. Kal dobara aayein! 🙏"
+    └── count < 5? → Continue
+         │
+         ▼
+    [NODE: GET_NEXT_RECOMMENDATION]
+    API: POST /getNextRecommendation { phone, category, excludeIds: [] }
+         │
+    ┌────┴─────────────────────────────────────────────┐
+    │                                                  │
+    ▼                                                  ▼
+[RESULT: Profile Found]                    [RESULT: No More Available]
+    │                                                  │
+    ▼                                          "🙏 Thank You!"
+Show Profile Card:                         "No More Recommendations"
+- Name                                     "Aap saare profiles dekh chuke hain"
+- Company                                  "Naye log join hone par aapko inform karenge"
+- Category
+- Bio (short)
+- Link1 / Link2
+         │
+         ▼
+    User Choice:
+    [1] → "Connect Request Bhejna Chahta Hoon"
+    [2] → "Agle Profile Dekhna Hai"
+    [3] → "Main Yahan Se Ruk Jaata Hoon"
+         │
+    ┌────┼────┐
+    ▼    ▼    ▼
+   [1]  [2]  [3]
+         │
+   [1] SEND REQUEST
+   API: POST /sendConnectionRequest { senderPhone, receiverPhone }
+   ├── MongoDB: Insert connection_request (status: pending)
+   ├── Google Sheet: Log event
+   └── 11za: Send template to receiverPhone → "XYZ ne aapko connect karna chahte hain" 
+              → receiverPhone: [Accept] / [Reject] buttons
+         │
+         ▼
+   [2] NEXT RECOMMENDATION
+   API: POST /getNextRecommendation (loop — excludeIds mein seen add karke)
+         │
+         ▼
+   [3] END SESSION
+   "Theek hai! Jab bhi networking karna ho, hum yahan hain 🤝"
+
+────────────────────────────────────────
+RECEIVER SIDE FLOW (User B):
+────────────────────────────────────────
+User B accepts → Button webhook → 
+API: POST /acceptConnectionRequest { senderPhone, receiverPhone }
+├── MongoDB: status = "accepted", acceptedAt = now
+├── Google Sheet: Log
+└── 11za: Send template to senderPhone → "🎉 [UserB] ne aapki request accept kar li!"
+
+User B rejects → 
+API: POST /rejectConnectionRequest { senderPhone, receiverPhone }
+├── MongoDB: status = "rejected"
+└── Google Sheet: Log (no notification to sender — silent reject)
+```
+
+---
+
+## 🛣️ 8. Complete API Endpoints Design
+
+```javascript
+// routes/flow.js (New routes add karni hain)
+
+// ── Existing ─────────────────────────────────────────────────────────
+POST   /checkUserProfile          // User profile check
+POST   /addUser                   // New user register
+POST   /updateUser/:mobile        // User profile update
+POST   /chatbotSearch             // Vector search (existing)
+POST   /getRecommendations        // Old recommendation (existing)
+
+// ── New Routes (Add Karne Hain) ──────────────────────────────────────
+POST   /getNextRecommendation     // ← Main new recommendation API
+POST   /markAsSeen                // ← Seen recommendation track karo
+POST   /checkDailyLimit           // ← Daily 5 limit check
+POST   /resetDailyLimit           // ← Admin ke liye (optional)
+
+POST   /sendConnectionRequest     // ← Request bhejna
+POST   /acceptConnectionRequest   // ← Request accept karna
+POST   /rejectConnectionRequest   // ← Request reject karna
+GET    /getConnectionStatus       // ← Status check karna
+
+POST   /logSeenToSheet            // ← Google Sheet sync (internal)
+```
+
+---
+
+## ⚙️ 9. getNextRecommendation — Core API (New Controller Function)
+
+```javascript
+// controller/flowController.js mein add karo
+
+exports.getNextRecommendation = async (req, res) => {
+  try {
+    const { phone, category, excludeIds = [] } = req.body;
+    if (!phone || !category) {
+      return responseManager.onBadRequest("phone aur category required hain", res);
+    }
+
+    const primary = mongoConnection.useDb(constants.DEFAULT_DB);
+    const User = primary.model(constants.MODELS.user, userModel);
+    const ConnectionRequest = primary.model(constants.MODELS.connectionRequest, connectionRequestModel);
+    const SeenRec = primary.model("seen_recommendations", seenRecommendationModel);
+    const DailyLimit = primary.model("daily_limits", dailyLimitModel);
+
+    // ── 1. Daily Limit Check ──────────────────────────────────────────
+    const today = new Date().toISOString().split("T")[0]; // "2024-03-10"
+    const limitDoc = await DailyLimit.findOne({ phone, date: today }).lean();
+    if (limitDoc && limitDoc.count >= 5) {
+      return responseManager.onSuccess("daily_limit_reached", {
+        message: "Aaj ke 5 recommendations ho gaye hain! Kal dobara aayein. 🙏",
+        dailyCount: limitDoc.count,
+        isEnd: false
+      }, res);
+    }
+
+    // ── 2. Get Seen Profile IDs ───────────────────────────────────────
+    const seenDocs = await SeenRec.find({ viewerPhone: phone })
+      .select("seenProfileId")
+      .lean();
+    const seenObjectIds = seenDocs.map(d => new mongoose.Types.ObjectId(d.seenProfileId));
+
+    // ── 3. Get Sent Request Profile IDs ──────────────────────────────
+    const sentRequests = await ConnectionRequest.find({
+      senderPhone: phone,
+      status: { $in: ["pending", "accepted"] }
+    }).select("receiverPhone").lean();
+    const sentPhones = sentRequests.map(r => r.receiverPhone).filter(Boolean);
+    let sentUserIds = [];
+    if (sentPhones.length > 0) {
+      const sentUsers = await User.find({ phone: { $in: sentPhones } }).select("_id").lean();
+      sentUserIds = sentUsers.map(u => new mongoose.Types.ObjectId(u._id));
+    }
+
+    // ── 4. Frontend excludeIds (chatbot se pass ho rahe IDs) ─────────
+    const frontEndExcludeIds = Array.isArray(excludeIds)
+      ? excludeIds
+          .flatMap(id => String(id).split(","))
+          .map(id => id.trim())
+          .filter(id => mongoose.Types.ObjectId.isValid(id))
+          .map(id => new mongoose.Types.ObjectId(id))
+      : [];
+
+    // ── 5. Merge ALL exclusions ────────────────────────────────────────
+    const allExcludedSet = new Set([
+      ...seenObjectIds.map(id => id.toString()),
+      ...sentUserIds.map(id => id.toString()),
+      ...frontEndExcludeIds.map(id => id.toString())
+    ]);
+    const allExcludedIds = [...allExcludedSet]
+      .filter(id => mongoose.Types.ObjectId.isValid(id))
+      .map(id => new mongoose.Types.ObjectId(id));
+
+    // ── 6. Check if ALL recommendations exhausted ─────────────────────
+    const totalAvailable = await User.countDocuments({
+      consent: true,
+      phone: { $ne: phone },
+      category: { $in: [category] }
+    });
+    if (allExcludedIds.length >= totalAvailable) {
+      return responseManager.onSuccess("no_more_recommendations", {
+        message: "🙏 Thank You! Aap saare available profiles dekh chuke hain. Naye members join karne par aapko dobara recommend karenge.",
+        isEnd: true
+      }, res);
+    }
+
+    // ── 7. Get current user's bio_vector ──────────────────────────────
+    const currentUser = await User.findOne({ phone }).select("bio_vector").lean();
+    const queryVec = Array.isArray(currentUser?.bio_vector)
+      ? currentUser.bio_vector.map(Number)
+      : null;
+
+    // ── 8. Vector Search ──────────────────────────────────────────────
+    let result = null;
+    if (queryVec && queryVec.length > 0) {
+      const pipeline = [
+        {
+          $vectorSearch: {
+            index: constants.VECTOR_INDEX,
+            path: "bio_vector",
+            queryVector: queryVec,
+            numCandidates: 100,
+            limit: 20
+          }
+        },
+        {
+          $match: {
+            _id: { $nin: allExcludedIds },
+            consent: true,
+            phone: { $ne: phone },
+            category: { $in: [category] }
+          }
+        },
+        { $limit: 1 },
+        {
+          $project: {
+            name: 1, company_name: 1, phone: 1,
+            bio: 1, link1: 1, link2: 1, category: 1
+          }
+        }
+      ];
+      const results = await User.aggregate(pipeline);
+      result = results[0] || null;
+    }
+
+    // ── 9. Fallback: Random if vector search fails ────────────────────
+    if (!result) {
+      result = await User.findOne({
+        _id: { $nin: allExcludedIds },
+        consent: true,
+        phone: { $ne: phone },
+        category: { $in: [category] }
+      })
+        .sort({ searchCount: 1 })
+        .select("name company_name phone bio link1 link2 category")
+        .lean();
+    }
+
+    // ── 10. Still no result — truly exhausted ────────────────────────
+    if (!result) {
+      return responseManager.onSuccess("no_more_recommendations", {
+        message: "🙏 Thank You! Aap saare available profiles dekh chuke hain.",
+        isEnd: true
+      }, res);
+    }
+
+    // ── 11. Mark as Seen ──────────────────────────────────────────────
+    await SeenRec.findOneAndUpdate(
+      { viewerPhone: phone, seenProfileId: result._id },
+      {
+        $setOnInsert: {
+          viewerPhone: phone,
+          seenProfileId: result._id,
+          seenProfilePhone: result.phone,
+          category,
+          seenAt: new Date()
+        }
+      },
+      { upsert: true, new: true }
+    );
+
+    // ── 12. Increment Daily Limit ─────────────────────────────────────
+    await DailyLimit.findOneAndUpdate(
+      { phone, date: today },
+      { $inc: { count: 1 } },
+      { upsert: true, new: true }
+    );
+
+    // ── 13. Increment profile's searchCount ──────────────────────────
+    await User.updateOne({ _id: result._id }, { $inc: { searchCount: 1 } });
+
+    // ── 14. Log to Google Sheet ───────────────────────────────────────
+    await logToGoogleSheet("SEEN_RECOMMENDATION", {
+      viewerPhone: phone,
+      seenProfilePhone: result.phone,
+      category,
+      timestamp: new Date().toISOString()
+    });
+
+    return responseManager.onSuccess("recommendation_found", {
+      recommendation: result,
+      isEnd: false
+    }, res);
+
+  } catch (error) {
+    console.error("[getNextRecommendation] Error:", error);
+    return responseManager.internalServer(error, res);
+  }
+};
+```
+
+---
+
+## 📊 10. Constants Update (utilities/constants.js)
+
+```javascript
+// utilities/constants.js — ye add karo
+
+module.exports = {
+  DEFAULT_DB: process.env.DB_NAME || "your_db_name",
+  VECTOR_INDEX: "vector_index",
+
+  MODELS: {
+    user: "users",
+    connectionRequest: "connection_requests",
+    seenRecommendation: "seen_recommendations",   // NEW
+    dailyLimit: "daily_limits",                    // NEW
+    flow: "flows",
+    category: "categories"
+  },
+
+  DAILY_RECOMMENDATION_LIMIT: 5,                  // Daily max recommendations
+
+  RECOMMENDATION_CATEGORIES: ["Startup", "Investor", "Others"],
+
+  // 11za Template Names
+  TEMPLATES: {
+    connectionRequest: "ivy_connection_request",
+    requestAccepted: "ivy_request_accepted",
+    requestRejected: "ivy_request_rejected"        // optional
+  }
+};
+```
+
+---
+
+## 📁 11. New Files Jo Banana Hai
+
+```
+d:\VectorSearch - Copy\
+├── models\
+│   ├── user.model.js              ✅ EXISTS (no change needed)
+│   ├── connectionRequest.model.js ✅ EXISTS (minor enhancement)
+│   ├── seenRecommendation.model.js ← 🆕 BANANA HAI
+│   └── dailyLimit.model.js         ← 🆕 BANANA HAI
+│
+├── utilities\
+│   ├── connetion.js               ✅ EXISTS
+│   ├── responseManager.js         ✅ EXISTS
+│   ├── constants.js               ✅ EXISTS (update karo)
+│   └── googleSheetLogger.js       ← 🆕 BANANA HAI
+│
+└── controller\
+    └── flowController.js          ✅ EXISTS (new functions add karo)
+        - getNextRecommendation()  ← 🆕 ADD KARO
+        - sendConnectionRequest()  ← 🆕 ADD KARO
+        - acceptConnectionRequest() ← 🆕 ADD KARO
+        - rejectConnectionRequest() ← 🆕 ADD KARO
+        - checkDailyLimit()        ← 🆕 ADD KARO
+```
+
+---
+
+## 🔐 12. Environment Variables (.env.local mein add karo)
+
+```env
+# Existing
+GEMINI_API_KEY=your_gemini_key
+MONGODB_URI=your_mongodb_uri
+
+# New — Google Sheets
+GOOGLE_SHEET_ID=your_spreadsheet_id_here
+GOOGLE_SERVICE_ACCOUNT_JSON={"type":"service_account","project_id":"..."}
+
+# 11za WhatsApp API
+IVY_API_URL=https://api.11za.in
+IVY_API_KEY=your_11za_api_key
+IVY_INSTANCE_ID=your_instance_id
+
+# DB Config
+DB_NAME=your_database_name
+```
+
+---
+
+## 🚀 13. Scaling Considerations
+
+| Area | Current | Scalable Approach |
+|------|---------|-------------------|
+| **Seen IDs** | User document mein array | ✅ Separate `seen_recommendations` collection |
+| **Daily Limit** | Not implemented | ✅ `daily_limits` collection + TTL index |
+| **Duplicate Requests** | Basic check | ✅ Compound unique index on `{senderPhone, receiverPhone}` |
+| **Vector Search** | Single $vectorSearch | ✅ Keep as-is, Atlas handles scaling |
+| **Google Sheet** | Not implemented | ✅ Async, non-blocking logger utility |
+| **Exclusion Query** | Max ~50 IDs | ✅ For 1000+ IDs → migrate to `$lookup` join |
+
+---
+
+## ⚠️ 14. Current Codebase Gaps (Jo Fix Karna Hai)
+
+> [!WARNING]
+> Ye issues tumhare existing [flowController.js](file:///d:/VectorSearch%20-%20Copy/controller/flowController.js) mein hain jo fix karne hain.
+
+1. **`alreadyShown` flag** — [searchUserByCategoryAndBio()](file:///d:/VectorSearch%20-%20Copy/controller/flowController.js#296-358) mein global `alreadyShown` use ho raha hai. Yeh per-user nahi hai. Replace karo `seen_recommendations` collection se.
+
+2. **Daily Limit** — Abhi koi daily limit nahi hai. `daily_limits` collection banana hai.
+
+3. **No End State** — Jab saari recommendations dekh li jaayein, system loop mein jaata hai. `isEnd: true` flag aur proper "Thank You" message add karna hai.
+
+4. **[sendConnectionRequest](file:///d:/VectorSearch%20-%20Copy/controller/flowController.js#995-1127)** — Function abhi properly implement nahi hai controller mein. Banana hai.
+
+5. **Google Sheet Logger** — Abhi koi logging nahi hai. `utilities/googleSheetLogger.js` banana hai.
+
+6. **`$vectorSearch` mein filter** — Abhi `$match` vectorSearch ke baad hai. Better hoga `preFilter` use karo (Atlas Vector Search supports it).
+
+---
+
+> [!TIP]
+> **Implementation Order:**
+> 1. `seenRecommendation.model.js` aur `dailyLimit.model.js` banao
+> 2. `constants.js` update karo (new model names add karo)
+> 3. `getNextRecommendation()` controller function add karo
+> 4. [sendConnectionRequest()](file:///d:/VectorSearch%20-%20Copy/controller/flowController.js#995-1127) / [acceptConnectionRequest()](file:///d:/VectorSearch%20-%20Copy/controller/flowController.js#1129-1296) add karo
+> 5. [routes/flow.js](file:///d:/VectorSearch%20-%20Copy/routes/flow.js) mein naye routes add karo
+> 6. `googleSheetLogger.js` banao aur integrate karo
+> 7. Test karo end-to-end chatbot flow

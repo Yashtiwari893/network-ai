@@ -2,25 +2,35 @@ const express = require("express");
 const router = express.Router();
 const flowController = require("../controller/flowController");
 
-router.post("/checkUserProfile", flowController.checkUserProfile);
-router.post("/addUser", flowController.addUser);
-router.post("/addUserVector", flowController.addUservector);
-router.post("/searchCompany", flowController.searchUser);
-router.post("/updateUser/:mobile", flowController.updateUser);
-router.post("/searchByCategory", flowController.searchUserByCategoryAndBio);
+// ─── User Management ─────────────────────────────────────────────────────────
+router.post("/checkUserProfile",  flowController.checkUserProfile);
+router.post("/addUser",           flowController.addUser);
+router.post("/addUserVector",     flowController.addUservector);
+router.post("/updateUser/:mobile",flowController.updateUser);
 router.post("/getCategoryByUser", flowController.getCategoryByUser);
-router.post("/getRecommendations", flowController.getRecommendations)
-router.post("/chatbotSearch", flowController.chatbotSearch)
 
-// Connection Request Flow
-router.post("/sendConnectionRequest",  flowController.sendConnectionRequest)
-router.post("/acceptConnectionRequest", flowController.acceptConnectionRequest)
-router.post("/getConnectionStatus",    flowController.getConnectionStatus)
+// ─── Search ──────────────────────────────────────────────────────────────────
+router.post("/searchCompany",    flowController.searchUser);
+router.post("/searchByCategory", flowController.searchUserByCategoryAndBio);
+router.post("/chatbotSearch",    flowController.chatbotSearch);
 
-// 11za Webhook — Template Button Reply (ACCEPT_ / CANCEL_ postback)
-router.post("/webhook/templateReply",  flowController.templateWebhook)
+// ─── Recommendation Engine (NEW) ─────────────────────────────────────────────
+router.post("/getNextRecommendation", flowController.getNextRecommendation); // NEW core API
+router.post("/checkDailyLimit",       flowController.checkDailyLimit);       // NEW daily 5 limit
+router.post("/getSeenCount",          flowController.getSeenCount);          // NEW debug/analytics
 
-// Diagnosis Route: check if DB is connected & env variables exist
+// ─── Old Recommendation (legacy) ─────────────────────────────────────────────
+router.post("/getRecommendations", flowController.getRecommendations);
+
+// ─── Connection Request Flow ──────────────────────────────────────────────────
+router.post("/sendConnectionRequest",    flowController.sendConnectionRequest);
+router.post("/acceptConnectionRequest",  flowController.acceptConnectionRequest);
+router.post("/getConnectionStatus",      flowController.getConnectionStatus);
+
+// ─── 11za Webhook — Template Button Reply (ACCEPT_ / CANCEL_ postback) ───────
+router.post("/webhook/templateReply", flowController.templateWebhook);
+
+// ─── Diagnostics ─────────────────────────────────────────────────────────────
 router.get("/db-status", flowController.getDbStatus);
 
-module.exports = router
+module.exports = router;
