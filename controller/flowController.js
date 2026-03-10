@@ -86,6 +86,10 @@ exports.addUservector = async (req, res) => {
       category = [category];
     }
 
+    // ✅ FIX: consent ko always boolean true/false mein normalize karo
+    // "demo", "yes", "true", 1, true → sab true; baaki false
+    const consentBool = Boolean(consent) && consent !== "false" && consent !== "0" && consent !== "no";
+
     let bio_vector = null;
     bio_vector = await main(bio);
 
@@ -93,7 +97,7 @@ exports.addUservector = async (req, res) => {
       name,
       company_name,
       category,
-      consent,
+      consent: consentBool,
       phone,
       link1,
       link2,
@@ -124,6 +128,9 @@ exports.addUser = async (req, res) => {
       category = [category];
     }
 
+    // ✅ FIX: consent ko always boolean normalize karo
+    const consentBool = Boolean(consent) && consent !== "false" && consent !== "0" && consent !== "no";
+
     let bio_vector = null;
     bio_vector = await main(bio);
 
@@ -131,7 +138,7 @@ exports.addUser = async (req, res) => {
       name,
       company_name,
       category,
-      consent,
+      consent: consentBool,
       phone,
       link1,
       link2,
@@ -1371,17 +1378,31 @@ exports.templateWebhook = async (req, res) => {
     }
 
     const body = req.body;
-    console.log('[Webhook] Received:', JSON.stringify(body));
+    const bodyStr = JSON.stringify(body);
+    console.log('[Webhook] Received:', bodyStr);
 
-    // Sirf button tap events handle karo
-    if (body?.event !== 'MoMessage::Postback') {
-      console.log('[Webhook] Ignoring event:', body?.event);
-      return res.status(200).json({ received: true, skipped: true });
+    // ── Galti Se Bachaav: Flexible Payload Extraction ──
+    let payload = '';
+    let fromPhone = '';
+
+    // Type 1: Standard Postback
+    if (body?.postback?.data) {
+      payload = body.postback.data;
+      fromPhone = body?.from || '';
+    } 
+    // Type 2: Inbound / Text / Interactive
+    else if (bodyStr.includes('ACCEPT_') || bodyStr.includes('CANCEL_')) {
+      const match = bodyStr.match(/(ACCEPT_[a-fA-F0-9]{24}|CANCEL_[a-fA-F0-9]{24})/);
+      if (match) {
+        payload = match[1];
+      }
+      fromPhone = body?.from || body?.mobile || body?.mobileNo || body?.sender || body?.phone || '';
     }
 
-
-    const payload   = body?.postback?.data || '';
-    const fromPhone = (body?.from || '').toString().trim();
+    if (!payload.startsWith('ACCEPT_') && !payload.startsWith('CANCEL_')) {
+      console.log('[Webhook] Ignoring event as no ACCEPT/CANCEL payload found.');
+      return res.status(200).json({ received: true, skipped: true });
+    }
 
     console.log(`[Webhook] payload="${payload}" from="${fromPhone}"`);
 
@@ -1667,13 +1688,19 @@ exports.getNextRecommendation = async (req, res) => {
     // ─── STEP 6: Check if ALL Profiles Exhausted ─────────────────────────────
     // Total available profiles count karo is category mein (excluding self)
     // Agar excluded >= total → saari recommendations dekh li hain → "Thank You"
+    //
+    // ✅ FIX: consent: true (boolean) ki jagah consent: { $in: [true, "demo", "yes", "true", 1] }
+    //   Kyunki purane users mein consent string ("demo") hai, naye mein boolean true.
+    //   Sahi fix: addUser mein boolean save karo (upar kiya) + yahan backward-compatible check.
+    const CONSENT_TRUTHY = { $in: [true, "demo", "yes", "true", 1] };
+
     const totalAvailable = await User.countDocuments({
       phone:    { $ne: cleanPhone },
-      consent:  true,
+      consent:  CONSENT_TRUTHY,
       category: { $in: [cleanCategory] }
     });
 
-    console.log(`[getNextRec] Total available in "${cleanCategory}": ${totalAvailable} | Excluded: ${allExcludedIds.length}`);
+    console.log(`[getNextRec] ${cleanPhone} | Category: "${cleanCategory}" | Available: ${totalAvailable} | Excluded: ${allExcludedIds.length}`);
 
     if (totalAvailable === 0 || allExcludedIds.length >= totalAvailable) {
       console.log(`[getNextRec] ✅ All recommendations exhausted for ${cleanPhone}`);
@@ -1716,7 +1743,7 @@ exports.getNextRecommendation = async (req, res) => {
             $match: {
               _id:      { $nin: allExcludedIds },
               phone:    { $ne: cleanPhone },
-              consent:  true,
+              consent:  CONSENT_TRUTHY,
               category: { $in: [cleanCategory] }
             }
           },
@@ -1746,7 +1773,7 @@ exports.getNextRecommendation = async (req, res) => {
       result = await User.findOne({
         _id:      { $nin: allExcludedIds },
         phone:    { $ne: cleanPhone },
-        consent:  true,
+        consent:  CONSENT_TRUTHY,
         category: { $in: [cleanCategory] }
       })
         .sort({ searchCount: 1 })  // Sabse kam recommended profile pehle
