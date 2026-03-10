@@ -1459,10 +1459,12 @@ exports.templateWebhook = async (req, res) => {
     // ── FIND THE REQUEST ───────────────────────────────────────────────────
     let request = null;
 
-    // Try finding by requestId if it looks like a valid ID
-    if (requestId && (mongoose.Types.ObjectId.isValid(requestId) || requestId.length > 10)) {
+    // Try finding by requestId ONLY if it is a valid MongoDB ObjectId
+    if (requestId && mongoose.Types.ObjectId.isValid(requestId)) {
       request = await ConnectionRequest.findById(requestId).lean();
       if (request) console.log(`[Webhook] Found request by requestId: ${requestId}`);
+    } else if (requestId) {
+      console.log(`[Webhook] requestId is not a valid ObjectId, skipping findById: ${requestId}`);
     }
 
     // Fallback: Try templateMessageId (contextMsgId)
