@@ -792,27 +792,28 @@ exports.chatbotSearch = async (req, res) => {
     // ── [FALLBACK] If vector search found 0 candidates, try keyword search ──
     if (!rawResults || rawResults.length === 0) {
       console.log('[DEBUG] ⚠️ Vector search found 0 candidates. Triggering Keyword Search Fallback...');
+      
+      const keywords = query.split(/\s+/).filter(k => k.length > 2); // jaise "Startup", "founder"
+      const searchTerms = keywords.length > 0 ? keywords : [query];
+
       const keywordMatch = {
         $and: [
           { _id: { $nin: allExcludedIds } },
           { bio_vector: { $exists: true, $ne: null, $not: { $size: 0 } } },
           {
-            $or: [
-              { bio: { $regex: query, $options: 'i' } },
-              { name: { $regex: query, $options: 'i' } },
-              { category: { $in: [query] } },
-              { company_name: { $regex: query, $options: 'i' } }
-            ]
+            $or: searchTerms.flatMap(term => [
+              { bio: { $regex: term, $options: 'i' } },
+              { name: { $regex: term, $options: 'i' } },
+              { category: { $regex: term, $options: 'i' } },
+              { company_name: { $regex: term, $options: 'i' } }
+            ])
           }
         ]
       };
+
       // For phone exclusion as well
       if (phone) {
-        // Find user by phone to exclude their own phone
-        const self = await User.findOne({ phone: phone.toString().trim() }).select('phone').lean();
-        if (self) {
-           keywordMatch.$and.push({ phone: { $ne: self.phone } });
-        }
+        keywordMatch.$and.push({ phone: { $ne: phone.toString().trim() } });
       }
 
       rawResults = await User.find(keywordMatch)
@@ -822,7 +823,7 @@ exports.chatbotSearch = async (req, res) => {
       
       // Add fake score for consistency structure
       rawResults = rawResults.map(r => ({ ...r, score: 1 }));
-      console.log(`[DEBUG] Keyword search found ${rawResults.length} candidates.`);
+      console.log(`[DEBUG] Flexible Keyword search found ${rawResults.length} candidates using terms: [${searchTerms.join(', ')}]`);
     }
 
     console.log(`[DEBUG] Vector search found ${rawResults.length} candidates.`);
