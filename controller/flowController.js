@@ -695,10 +695,12 @@ exports.chatbotSearch = async (req, res) => {
 
     // ── [DEBUG] Total documents in collection ───────────────────────────────────
     const totalDocs = await User.countDocuments({});
-    const docsWithVector = await User.countDocuments({ bio_vector: { $exists: true, $ne: null } });
+    const docsWithAnyVector = await User.countDocuments({ bio_vector: { $exists: true, $ne: null } });
+    const docsWithValidVector = await User.countDocuments({ bio_vector: { $exists: true, $ne: null, $not: { $size: 0 } } });
     console.log(`[DEBUG] Total users in DB: ${totalDocs}`);
-    console.log(`[DEBUG] Users WITH bio_vector: ${docsWithVector}`);
-    console.log(`[DEBUG] Users WITHOUT bio_vector: ${totalDocs - docsWithVector}`);
+    console.log(`[DEBUG] Users with ANY bio_vector: ${docsWithAnyVector}`);
+    console.log(`[DEBUG] Users with VALID bio_vector (>0 length): ${docsWithValidVector}`);
+    console.log(`[DEBUG] Users with EMPTY bio_vector: ${docsWithAnyVector - docsWithValidVector}`);
 
     const queryVec = await main(query);
 
@@ -762,20 +764,33 @@ exports.chatbotSearch = async (req, res) => {
           index: constants.VECTOR_INDEX,
           path: 'bio_vector',
           queryVector: queryVec,
-          numCandidates: 50,
-          limit: 10
+          numCandidates: 100, // Increased candidates to find more potential matches
+          limit: 20           // Fetch more results before filtering
         }
       },
       { $addFields: { score: { $meta: 'vectorSearchScore' } } },
-      ...(Object.keys(matchConditions).length > 0 ? [{ $match: matchConditions }] : []),
-      { $limit: 5 },
-      { $project: { name: 1, company_name: 1, phone: 1, category: 1, bio: 1, link1: 1, score: 1 } }
+      // Optional: Add a match here to see what we're getting before filtering by ID
+      { $limit: 20 },
+      { $project: { _id: 1, name: 1, company_name: 1, phone: 1, category: 1, bio: 1, link1: 1, score: 1 } }
     ];
 
-    console.log('[DEBUG] matchConditions going to $match:', JSON.stringify(matchConditions));
-    console.log('[DEBUG] Running aggregate pipeline...');
+    console.log('[DEBUG] Running aggregate pipeline (Pre-match exploration)...');
+    let rawResults = await User.aggregate(pipeline, { maxTimeMS: 30000, allowDiskUse: true });
+    console.log(`[DEBUG] Vector search found ${rawResults.length} candidates.`);
 
-    const results = await User.aggregate(pipeline, { maxTimeMS: 30000, allowDiskUse: true });
+    // Log the phones of found candidates to see if they match the searcher
+    const candidatesPhones = rawResults.map(r => r.phone);
+    console.log(`[DEBUG] Candidate phones: [${candidatesPhones.join(', ')}]`);
+
+    // Apply the filtering logic locally if needed for debug, or proceed with the match
+    let results = rawResults.filter(r => {
+      if (phone && r.phone === phone.toString().trim()) return false;
+      const idStr = r._id.toString();
+      if (allExcludedSet.has(idStr)) return false;
+      return true;
+    }).slice(0, 5);
+
+    // (Filtering is now done above via filter() for better debugging)
 
     // ── [DEBUG] Results ─────────────────────────────────────────────────────────
     console.log(`[DEBUG] Pipeline returned ${results.length} result(s).`);
