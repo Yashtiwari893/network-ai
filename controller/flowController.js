@@ -820,14 +820,17 @@ exports.chatbotSearch = async (req, res) => {
         .select('_id name company_name phone category bio link1')
         .limit(20)
         .lean();
+
+      // Shuffle raw results to give variety on "Show Next" if multiple results exist
+      rawResults = rawResults.sort(() => Math.random() - 0.5);
       
       // Add fake score for consistency structure
-      rawResults = rawResults.map(r => ({ ...r, score: 1 }));
+      rawResults = rawResults.map(r => ({ ...r, score: 0.5 }));
       console.log(`[DEBUG] Flexible Keyword search found ${rawResults.length} candidates using terms: [${searchTerms.join(', ')}]`);
     }
 
     console.log(`[DEBUG] Vector search found ${rawResults.length} candidates.`);
-
+    
     // Log the phones of found candidates to see if they match the searcher
     const candidatesPhones = rawResults.map(r => r.phone);
     console.log(`[DEBUG] Candidate phones: [${candidatesPhones.join(', ')}]`);
@@ -838,10 +841,13 @@ exports.chatbotSearch = async (req, res) => {
       const idStr = r._id.toString();
       if (allExcludedSet.has(idStr)) return false;
       return true;
-    }).slice(0, 5);
+    });
+
+    // Shuffle the final results for variety if multiple matches exist
+    results = results.sort(() => Math.random() - 0.5).slice(0, 5);
 
     // ── [DEBUG] Results ─────────────────────────────────────────────────────────
-    console.log(`[DEBUG] Pipeline returned ${results.length} result(s).`);
+    console.log(`[DEBUG] Final selection (shuffled) count: ${results.length}`);
     if (results.length > 0) {
       console.log('[DEBUG] Top result:', JSON.stringify({ name: results[0].name, score: results[0].score, category: results[0].category }));
     }
