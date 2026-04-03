@@ -32,9 +32,6 @@ const SHEET_TABS = {
   CONNECTION_REQUESTS:  "ConnectionRequests",
   DAILY_LIMITS:         "DailyLimits",
   SYSTEM_EVENTS:        "SystemEvents",
-  USERS_INVESTORS:      "Investors",
-  USERS_STARTUPS:       "Startups",
-  USERS_OTHERS:         "Others",
 };
 
 /**
@@ -62,67 +59,6 @@ async function getAuthClient() {
 
   _authClient = await auth.getClient();
   return _authClient;
-}
-
-/**
- * Har table ke liye headers define karo (Setup ke liye)
- */
-const SHEET_HEADERS = {
-  [SHEET_TABS.SEEN_RECOMMENDATIONS]: ["Viewer Phone", "Seen Phone", "Profile ID", "Category", "Timestamp"],
-  [SHEET_TABS.CONNECTION_REQUESTS]:  ["Sender Phone", "Receiver Phone", "Status", "Request ID", "Timestamp"],
-  [SHEET_TABS.DAILY_LIMITS]:         ["Phone", "Date", "Count", "Timestamp"],
-  [SHEET_TABS.SYSTEM_EVENTS]:        ["Event Type", "Detail", "Timestamp"],
-  [SHEET_TABS.USERS_INVESTORS]:      ["Name", "Phone", "Company", "Category", "Bio", "Link 1", "Link 2", "Consent", "Timestamp"],
-  [SHEET_TABS.USERS_STARTUPS]:       ["Name", "Phone", "Company", "Category", "Bio", "Link 1", "Link 2", "Consent", "Timestamp"],
-  [SHEET_TABS.USERS_OTHERS]:         ["Name", "Phone", "Company", "Category", "Bio", "Link 1", "Link 2", "Consent", "Timestamp"],
-};
-
-/**
- * Automatiaclly creates tabs and sets headers if they don't exist.
- */
-async function ensureSheetSetup() {
-  const spreadsheetId = process.env.GOOGLE_SHEET_ID;
-  if (!spreadsheetId) return;
-
-  const authClient = await getAuthClient();
-  const sheets = google.sheets({ version: "v4", auth: authClient });
-
-  // 1. Get current sheets
-  const spreadsheet = await sheets.spreadsheets.get({ spreadsheetId });
-  const existingSheetNames = (spreadsheet.data.sheets || []).map(s => s.properties.title);
-
-  const missingTabs = Object.values(SHEET_TABS).filter(name => !existingSheetNames.includes(name));
-
-  // 2. Create missing tabs
-  if (missingTabs.length > 0) {
-    console.log(`[GoogleSheet] Creating missing tabs: ${missingTabs.join(", ")}`);
-    await sheets.spreadsheets.batchUpdate({
-      spreadsheetId,
-      resource: {
-        requests: missingTabs.map(name => ({
-          addSheet: { properties: { title: name } }
-        }))
-      }
-    });
-  }
-
-  // 3. Ensure headers for all tabs
-  for (const [tabName, headers] of Object.entries(SHEET_HEADERS)) {
-    const response = await sheets.spreadsheets.values.get({
-      spreadsheetId,
-      range: `${tabName}!A1:Z1`,
-    });
-
-    if (!response.data.values || response.data.values[0].length === 0) {
-      console.log(`[GoogleSheet] 🛠 Setting headers for ${tabName}`);
-      await sheets.spreadsheets.values.update({
-        spreadsheetId,
-        range: `${tabName}!A1`,
-        valueInputOption: "USER_ENTERED",
-        resource: { values: [headers] },
-      });
-    }
-  }
 }
 
 /**
@@ -157,6 +93,14 @@ async function appendRow(sheetTab, rowData) {
  *
  * @param {string} eventType - Event ka naam (niche diye gaye types mein se)
  * @param {Object} data      - Event-specific data object
+ *
+ * Supported eventTypes:
+ *   "SEEN_RECOMMENDATION"   — Recommendation dekhi gayi
+ *   "CONNECTION_REQUEST"    — Request bheji gayi (pending)
+ *   "REQUEST_ACCEPTED"      — Request accept hui
+ *   "REQUEST_REJECTED"      — Request reject hui
+ *   "DAILY_LIMIT_REACHED"   — User ka din ka limit khatam
+ *   "ALL_RECOMMENDATIONS_DONE" — Saare profiles dekh liye
  */
 async function logToGoogleSheet(eventType, data) {
   try {
@@ -164,6 +108,7 @@ async function logToGoogleSheet(eventType, data) {
     const timestamp = data.timestamp || new Date().toISOString();
 
     switch (eventType) {
+
       // ── Recommendation dekhi gayi ──────────────────────────────────────
       case "SEEN_RECOMMENDATION":
         sheetTab = SHEET_TABS.SEEN_RECOMMENDATIONS;
@@ -182,7 +127,7 @@ async function logToGoogleSheet(eventType, data) {
         row = [
           data.senderPhone   || "",
           data.receiverPhone || "",
-          data.status        || "pending",
+          "pending",
           data.requestId     || "",
           timestamp,
         ];
@@ -233,32 +178,6 @@ async function logToGoogleSheet(eventType, data) {
         ];
         break;
 
-      // ── New User Registration ──────────────────────────────────────────
-      case "NEW_USER":
-        const userCategory = Array.isArray(data.category) ? data.category[0] : (data.category || "");
-        const catStr = String(userCategory).toLowerCase();
-        
-        if (catStr.includes("investor")) {
-          sheetTab = SHEET_TABS.USERS_INVESTORS;
-        } else if (catStr.includes("startup") || catStr.includes("founder")) {
-          sheetTab = SHEET_TABS.USERS_STARTUPS;
-        } else {
-          sheetTab = SHEET_TABS.USERS_OTHERS;
-        }
-
-        row = [
-          data.name         || "",
-          data.phone        || "",
-          data.company_name || "",
-          Array.isArray(data.category) ? data.category.join(", ") : (data.category || ""),
-          data.bio          || "",
-          data.link1        || "",
-          data.link2        || "",
-          data.consent      ? "Yes" : "No",
-          timestamp,
-        ];
-        break;
-
       default:
         sheetTab = SHEET_TABS.SYSTEM_EVENTS;
         row = [
@@ -272,8 +191,9 @@ async function logToGoogleSheet(eventType, data) {
     console.log(`[GoogleSheet] ✅ Logged: ${eventType}`);
 
   } catch (err) {
+    // ⚠️ IMPORTANT: Sheet fail hone par main flow NAHI rukega — sirf log karo
     console.error(`[GoogleSheet] ❌ Failed to log "${eventType}":`, err.message);
   }
 }
 
-module.exports = { logToGoogleSheet, ensureSheetSetup };
+module.exports = { logToGoogleSheet };

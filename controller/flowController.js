@@ -8,14 +8,9 @@ const dailyLimitModel = require("../models/dailyLimit.model");               // 
 const constants = require("../utilities/constants");
 const categoryModel = require("../models/category.model");
 const axios = require("axios");
-const { GoogleGenAI } = require("@google/genai");
-
-// ✅ Initialize AI once if API key exists
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
-let aiClient = null;
-if (GEMINI_API_KEY) {
-  aiClient = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
-}
+const { GoogleGenAI } = require('@google/genai');
+const mongoose = require("mongoose");
+const { logToGoogleSheet } = require("../utilities/googleSheetLogger");      // NEW
 
 exports.checkUserProfile = async (req, res) => {
   try {
@@ -67,31 +62,25 @@ function formatPhoneFor11za(phone) {
 
 async function getEmbedding(text) {
   try {
-    // ⚠️ Security check
-    if (!process.env.GEMINI_API_KEY) {
-      console.error("[GEMINI] ❌ API KEY IS MISSING IN ENV!");
-      throw new Error("API Key not found in Environment Variables.");
-    }
-
-    if (!aiClient) {
-      aiClient = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-    }
+    const ai = new GoogleGenAI({
+      apiKey: process.env.GEMINI_API_KEY,
+    });
 
     // Call embedContent
-    const response = await aiClient.models.embedContent({
+    const response = await ai.models.embedContent({
       model: "gemini-embedding-001",
       contents: text,
     });
-    
     if (!response.embeddings || response.embeddings.length === 0) {
-      console.error("[GEMINI] No embeddings returned");
+      console.error("No embeddings returned");
       return null;
     }
 
+    // Return the vector values (first embedding)
     return response.embeddings[0].values;
-  } catch (err) {
-    console.error(`[GEMINI] ❌ Embedding generation FAILED:`, err.message);
-    throw err; // Rethrow to let chatbotSearch catch it
+  } catch (error) {
+    console.error("Error generating embedding:", error);
+    return null;
   }
 }
 
@@ -163,20 +152,6 @@ exports.addUser = async (req, res) => {
       .create(obj);
 
     console.log("User created successfully:", userData._id);
-
-    // ✅ Google Sheet Log (Wait for it specifically in Vercel to ensure entry)
-    console.log(`[Flow] Logging new user to Google Sheet: ${userData.phone} (${userData.name})`);
-    await logToGoogleSheet("NEW_USER", {
-      name:         userData.name,
-      phone:        userData.phone,
-      company_name: userData.company_name,
-      category:     userData.category,
-      bio:          userData.bio,
-      link1:        userData.link1,
-      link2:        userData.link2,
-      consent:      userData.consent
-    }).catch(err => console.error("[GoogleSheet] Async log failed:", err.message));
-
     return responseManager.onSuccess("Data added successfully", userData, res);
   } catch (error) {
     console.error("Error adding user:", error?.response?.data || error);
@@ -1165,13 +1140,6 @@ exports.sendConnectionRequest = async (req, res) => {
       console.error("[11za] ivy_connection_request template send failed:", templateErr?.response?.data || templateErr.message);
     }
 
-    // ✅ Google Sheet Log (Nom-blocking)
-    logToGoogleSheet("CONNECTION_REQUEST", {
-      senderPhone:   newRequest.senderPhone,
-      receiverPhone: newRequest.receiverPhone,
-      requestId:     newRequest._id.toString()
-    });
-
     return responseManager.onSuccess("Connection request sent", {
       requestId:     newRequest._id,
       senderPhone:   newRequest.senderPhone,
@@ -1599,13 +1567,6 @@ exports.templateWebhook = async (req, res) => {
         }
       });
 
-      // ✅ Google Sheet Log (Nom-blocking)
-      logToGoogleSheet("REQUEST_ACCEPTED", {
-        senderPhone:   userAPhone,
-        receiverPhone: userBPhone,
-        requestId:     request._id.toString()
-      });
-
       return res.status(200).json({
         received: true,
         action:   'accepted',
@@ -1634,13 +1595,6 @@ exports.templateWebhook = async (req, res) => {
           data:         []
         }).catch(e => console.log('[Webhook] Cancel notify skipped:', e.message));
       }
-
-      // ✅ Google Sheet Log (Nom-blocking)
-      logToGoogleSheet("REQUEST_REJECTED", {
-        senderPhone:   request.senderPhone,
-        receiverPhone: request.receiverPhone,
-        requestId:     request._id.toString()
-      });
 
       return res.status(200).json({ received: true, action: 'cancelled' });
     }
