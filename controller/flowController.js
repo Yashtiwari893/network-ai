@@ -761,6 +761,33 @@ exports.chatbotSearch = async (req, res) => {
       .filter(id => mongoose.Types.ObjectId.isValid(id))
       .map(id => new mongoose.Types.ObjectId(id));
 
+    // ── NEW: Daily View Limit Check (5 per day) ────────────────────────────────
+    const todayStr = new Date().toISOString().split('T')[0];
+    const DailyLimit = primary.model(constants.MODELS.dailyLimit, dailyLimitModel);
+    const SeenRecommendation = primary.model(constants.MODELS.seenRecommendation, seenRecommendationModel);
+
+    if (phone) {
+      const viewerPhone = phone.toString().trim();
+      
+      // 1. Check daily view limit
+      const limitDoc = await DailyLimit.findOne({ phone: viewerPhone, date: todayStr }).lean();
+      if (limitDoc && limitDoc.count >= 5) {
+        console.log(`[DEBUG] 🛑 Daily view limit reached for ${viewerPhone}`);
+        return responseManager.onSuccess("Aaj ki aapki 5 profiles ki limit puri ho gayi hai. Agle 24 ghante baad naye profiles dikhenge.", [], res);
+      }
+
+      // 2. Fetch all-time seen profiles to exclude
+      const seenDocs = await SeenRecommendation.find({ viewerPhone }).select('seenProfileId').lean();
+      const seenIds = seenDocs.map(d => d.seenProfileId.toString());
+      seenIds.forEach(id => allExcludedSet.add(id));
+      
+      // Re-sync allExcludedIds
+      allExcludedIds.length = 0;
+      allExcludedSet.forEach(id => {
+        if (mongoose.Types.ObjectId.isValid(id)) allExcludedIds.push(new mongoose.Types.ObjectId(id));
+      });
+    }
+
     console.log(`[DEBUG] excludeIds from frontend: ${excludeObjectIds.length}`);
     console.log(`[DEBUG] sentUserIds from DB: ${sentUserIds.length}`);
     console.log(`[DEBUG] Total excluded IDs: ${allExcludedIds.length}`);
@@ -855,6 +882,31 @@ exports.chatbotSearch = async (req, res) => {
 
     if (!results || results.length === 0) {
       return responseManager.onSuccess('No matching profiles found', [], res);
+    }
+
+    // ── NEW: Record View & Increment Limit ──────────────────────────────────────
+    if (phone && results.length > 0) {
+      const viewerPhone = phone.toString().trim();
+      const viewedUser = results[0]; // Tracking the top one shown
+
+      try {
+        // 1. Increment daily limit
+        await DailyLimit.updateOne(
+          { phone: viewerPhone, date: todayStr },
+          { $inc: { count: 1 } },
+          { upsert: true }
+        );
+
+        // 2. Mark as seen all-time
+        await SeenRecommendation.updateOne(
+          { viewerPhone, seenProfileId: viewedUser._id },
+          { $set: { seenProfilePhone: viewedUser.phone, seenAt: new Date() } },
+          { upsert: true }
+        );
+        console.log(`[DEBUG] ✅ View recorded for ${viewerPhone} -> ${viewedUser.name}`);
+      } catch (err) {
+        console.error("[DEBUG] Error updating view limits:", err.message);
+      }
     }
 
     return responseManager.onSuccess('Search results', results, res);
@@ -1131,6 +1183,18 @@ exports.sendConnectionRequest = async (req, res) => {
       connectionRequestModel
     );
     const User = primary.model(constants.MODELS.user, userModel);
+    const DailyLimit = primary.model(constants.MODELS.dailyLimit, dailyLimitModel);
+
+    // ── NEW: Daily Request Limit Check (3 per day) ─────────────────────────────
+    const todayStr = new Date().toISOString().split('T')[0];
+    const senderClean = senderPhone.toString().trim();
+    
+    // Using a separate key "request_count" in the same dailyLimit collection
+    const limitDoc = await DailyLimit.findOne({ phone: senderClean, date: todayStr }).lean();
+    if (limitDoc && limitDoc.request_count >= 3) {
+      console.log(`[DEBUG] 🛑 Daily request limit reached for ${senderClean}`);
+      return responseManager.onBadRequest("Aap ek din mein sirf 3 hi requests bhej sakte hain. Agle 24 ghante baad try kariyega.", res);
+    }
 
     // Prepare possible phone formats for robust matching
     const senderStr = senderPhone.trim();
@@ -1179,6 +1243,17 @@ exports.sendConnectionRequest = async (req, res) => {
     });
 
     console.log("Connection request created:", newRequest._id);
+
+    // ── NEW: Increment Request Counter ──────────────────────────────────────────
+    try {
+      await DailyLimit.updateOne(
+        { phone: senderClean, date: todayStr },
+        { $inc: { request_count: 1 } },
+        { upsert: true }
+      );
+    } catch (err) {
+      console.error("[DEBUG] Error updating request limits:", err.message);
+    }
 
     // ✅ 11za API se ivy_connection_request template User B (receiver) ko bhejo
     //
