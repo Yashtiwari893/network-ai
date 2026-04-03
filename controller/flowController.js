@@ -788,21 +788,56 @@ exports.chatbotSearch = async (req, res) => {
 
     console.log('[DEBUG] Running aggregate pipeline (Pre-match exploration)...');
     let rawResults = await User.aggregate(pipeline, { maxTimeMS: 30000, allowDiskUse: true });
+    
+    // ── [FALLBACK] If vector search found 0 candidates, try keyword search ──
+    if (!rawResults || rawResults.length === 0) {
+      console.log('[DEBUG] ⚠️ Vector search found 0 candidates. Triggering Keyword Search Fallback...');
+      const keywordMatch = {
+        $and: [
+          { _id: { $nin: allExcludedIds } },
+          { bio_vector: { $exists: true, $ne: null, $not: { $size: 0 } } },
+          {
+            $or: [
+              { bio: { $regex: query, $options: 'i' } },
+              { name: { $regex: query, $options: 'i' } },
+              { category: { $in: [query] } },
+              { company_name: { $regex: query, $options: 'i' } }
+            ]
+          }
+        ]
+      };
+      // For phone exclusion as well
+      if (phone) {
+        // Find user by phone to exclude their own phone
+        const self = await User.findOne({ phone: phone.toString().trim() }).select('phone').lean();
+        if (self) {
+           keywordMatch.$and.push({ phone: { $ne: self.phone } });
+        }
+      }
+
+      rawResults = await User.find(keywordMatch)
+        .select('_id name company_name phone category bio link1')
+        .limit(20)
+        .lean();
+      
+      // Add fake score for consistency structure
+      rawResults = rawResults.map(r => ({ ...r, score: 1 }));
+      console.log(`[DEBUG] Keyword search found ${rawResults.length} candidates.`);
+    }
+
     console.log(`[DEBUG] Vector search found ${rawResults.length} candidates.`);
 
     // Log the phones of found candidates to see if they match the searcher
     const candidatesPhones = rawResults.map(r => r.phone);
     console.log(`[DEBUG] Candidate phones: [${candidatesPhones.join(', ')}]`);
 
-    // Apply the filtering logic locally if needed for debug, or proceed with the match
+    // Apply the filtering logic locally
     let results = rawResults.filter(r => {
       if (phone && r.phone === phone.toString().trim()) return false;
       const idStr = r._id.toString();
       if (allExcludedSet.has(idStr)) return false;
       return true;
     }).slice(0, 5);
-
-    // (Filtering is now done above via filter() for better debugging)
 
     // ── [DEBUG] Results ─────────────────────────────────────────────────────────
     console.log(`[DEBUG] Pipeline returned ${results.length} result(s).`);
