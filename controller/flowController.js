@@ -97,11 +97,19 @@ exports.addUservector = async (req, res) => {
     let bio_vector = null;
     bio_vector = await main(bio);
 
+    // ✅ Standardise consent to boolean
+    const isConsentTrue = 
+      consent === true || 
+      consent === "true" || 
+      consent === "demo" || 
+      consent === "1" || 
+      consent === "yes";
+
     const obj = {
       name,
       company_name,
       category,
-      consent,
+      consent: isConsentTrue,
       phone,
       link1,
       link2,
@@ -135,11 +143,19 @@ exports.addUser = async (req, res) => {
     let bio_vector = null;
     bio_vector = await main(bio);
 
+    // ✅ Standardise consent to boolean (handle both string "true"/"demo" and boolean)
+    const isConsentTrue = 
+      consent === true || 
+      consent === "true" || 
+      consent === "demo" || 
+      consent === "1" || 
+      consent === "yes";
+
     const obj = {
       name,
       company_name,
       category,
-      consent,
+      consent: isConsentTrue,
       phone,
       link1,
       link2,
@@ -1749,14 +1765,21 @@ exports.getNextRecommendation = async (req, res) => {
     console.log(`[getNextRec] ${cleanPhone} | Category: ${cleanCategory} | Total excluded: ${allExcludedIds.length}`);
 
     // ─── STEP 6: Check if ALL Profiles Exhausted ─────────────────────────────
-    // Total available profiles count karo is category mein (excluding self)
-    // Agar excluded >= total → saari recommendations dekh li hain → "Thank You"
-    const totalAvailable = await User.countDocuments({
-      phone:    { $ne: cleanPhone },
-      consent:  true,
-      category: { $in: [cleanCategory] }
-    });
+    // Robust checks: handle both boolean and string "true" for consent
+    // And handle case-insensitive category matches
+    const searchFilter = {
+      phone:    { $ne: cleanPhone }, // Still check common phone string
+      $and: [
+        { phone: { $ne: cleanPhone.toString() } },
+        { phone: { $ne: cleanPhone.toString().replace(/^91/, '') } }
+      ],
+      consent:  { $in: [true, "true", "demo"] }, 
+      category: { $in: [new RegExp('^' + cleanCategory + '$', 'i')] } 
+    };
 
+    const totalAvailable = await User.countDocuments(searchFilter);
+
+    console.log(`[getNextRec] ${cleanPhone} | Search Filter (debug):`, JSON.stringify(searchFilter));
     console.log(`[getNextRec] Total available in "${cleanCategory}": ${totalAvailable} | Excluded: ${allExcludedIds.length}`);
 
     if (totalAvailable === 0 || allExcludedIds.length >= totalAvailable) {
@@ -1800,8 +1823,8 @@ exports.getNextRecommendation = async (req, res) => {
             $match: {
               _id:      { $nin: allExcludedIds },
               phone:    { $ne: cleanPhone },
-              consent:  true,
-              category: { $in: [cleanCategory] }
+              consent:  { $in: [true, "true", "demo"] },
+              category: { $in: [new RegExp('^' + cleanCategory + '$', 'i')] }
             }
           },
           { $limit: 1 },
@@ -1830,8 +1853,8 @@ exports.getNextRecommendation = async (req, res) => {
       result = await User.findOne({
         _id:      { $nin: allExcludedIds },
         phone:    { $ne: cleanPhone },
-        consent:  true,
-        category: { $in: [cleanCategory] }
+        consent:  { $in: [true, "true", "demo"] },
+        category: { $in: [new RegExp('^' + cleanCategory + '$', 'i')] }
       })
         .sort({ searchCount: 1 })  // Sabse kam recommended profile pehle
         .select("name company_name phone bio link1 link2 category")
