@@ -40,20 +40,18 @@ async function connectToDatabase() {
   return cached.conn;
 }
 
-// Keeping the original export pattern for compatibility but adding the promise ensure
+// Disabled buffering so we get direct errors instead of hanging for 10s
+mongoose.set('bufferCommands', false);
+
 const mongoDB = mongoose.createConnection(process.env.MONGODB_URL, options);
 
 // Listen for connection events for logging
 mongoDB.on('connected', () => console.log('MongoDB connected through createConnection'));
 mongoDB.on('error', (err) => {
     console.error('MongoDB error through createConnection:', err.message);
-    if (err.name === 'MongoServerSelectionError') {
-      console.error('Check your IP Whitelist (0.0.0.0/0) or Credentials!');
-    }
 });
 mongoDB.on('disconnected', () => console.log('MongoDB disconnected through createConnection'));
 
-// Disable buffering so we get direct errors instead of hanging for 10s
-mongoose.set('bufferCommands', false);
-
+// Exporting both the connection and its promise
 module.exports = mongoDB;
+module.exports.connectionPromise = mongoDB.asPromise();

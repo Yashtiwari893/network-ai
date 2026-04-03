@@ -14,6 +14,10 @@ const { logToGoogleSheet } = require("../utilities/googleSheetLogger");      // 
 
 exports.checkUserProfile = async (req, res) => {
   try {
+    if (mongoConnection.readyState !== 1) {
+      console.log("Waiting for MongoDB connection...");
+      await mongoConnection.connectionPromise;
+    }
     const primary = mongoConnection.useDb(constants.DEFAULT_DB);
     const { phone } = req.body;
     if (!phone) {
@@ -86,6 +90,10 @@ async function getEmbedding(text) {
 
 exports.addUservector = async (req, res) => {
   try {
+    if (mongoConnection.readyState !== 1) {
+      console.log("Waiting for MongoDB connection...");
+      await mongoConnection.connectionPromise;
+    }
     const primary = mongoConnection.useDb(constants.DEFAULT_DB);
     let { name, company_name, category, consent, phone, link1, link2, bio } = req.body;
     console.log(":::::req.body:::::", JSON.stringify(req.body));
@@ -679,6 +687,10 @@ exports.getCategoryByUser = async (req, res) => {
 // -----------------------------------------------------------------------------
 exports.chatbotSearch = async (req, res) => {
   try {
+    if (mongoConnection.readyState !== 1) {
+      console.log("Waiting for MongoDB connection...");
+      await mongoConnection.connectionPromise;
+    }
     const { query, phone, excludeIds } = req.body;
 
     // ── [DEBUG] Request body log ────────────────────────────────────────────────
