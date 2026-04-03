@@ -790,6 +790,30 @@ exports.chatbotSearch = async (req, res) => {
       return true;
     }).slice(0, 5);
 
+    // ── [FALLBACK] ─────────────────────────────────────────────────────────────
+    if (results.length === 0) {
+      console.log('[DEBUG] ⚠️ Vector results empty. Running Keyword Fallback...');
+      const keywords = query.split(' ').filter(k => k.length > 2);
+      const regexArr = keywords.map(k => new RegExp(k, 'i'));
+
+      const fallbackQuery = {
+        $or: [
+          { bio: { $in: regexArr } },
+          { name: { $in: regexArr } },
+          { company_name: { $in: regexArr } }
+        ],
+        _id: { $nin: allExcludedIds }
+      };
+      if (phone) fallbackQuery.phone = { $ne: phone.toString().trim() };
+
+      results = await User.find(fallbackQuery)
+        .limit(5)
+        .select('name company_name phone category bio link1')
+        .lean();
+      
+      console.log(`[DEBUG] Keyword Fallback found ${results.length} result(s).`);
+    }
+
     // (Filtering is now done above via filter() for better debugging)
 
     // ── [DEBUG] Results ─────────────────────────────────────────────────────────
